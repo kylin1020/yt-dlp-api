@@ -526,6 +526,7 @@ async def get_monitor():
         "bandwidth": {
             "current_speed": format_size(total_speed) + "/s",
             "active_downloads": active_count,
+            "max_concurrent": MAX_CONCURRENT,
         },
     }
 
