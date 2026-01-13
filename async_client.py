@@ -389,48 +389,74 @@ class AsyncYtDlpClient:
         self, url: str, params: Optional[dict] = None,
         save_dir: str = ".", show_progress: bool = True
     ) -> list[str]:
-        """一站式下载：创建任务、等待完成、下载文件"""
-        task_id, existed = await self.create_task(url, params)
-        if show_progress:
-            print(f"{'任务已存在' if existed else '创建任务'}: {task_id}")
+        """一站式下载：创建任务、等待完成、下载文件。支持 Ctrl+C 取消任务。"""
+        task_id = None
+        try:
+            task_id, existed = await self.create_task(url, params)
+            if show_progress:
+                print(f"{'任务已存在' if existed else '创建任务'}: {task_id}")
 
-        status = await self.wait_for_task(task_id, show_progress)
+            status = await self.wait_for_task(task_id, show_progress)
 
-        if status.status == "failed":
-            raise TaskFailedError(task_id, status.error)
-        if status.status == "cancelled":
-            raise TaskCancelledError(task_id)
+            if status.status == "failed":
+                raise TaskFailedError(task_id, status.error)
+            if status.status == "cancelled":
+                raise TaskCancelledError(task_id)
 
-        # 使用 parfive 批量下载所有文件
-        files_to_download = [
-            (f.file_id, os.path.join(save_dir, f.filename))
-            for f in status.files
-        ]
-        if show_progress:
-            print(f"开始下载 {len(files_to_download)} 个文件...")
-        return self.download_files(files_to_download, show_progress)
+            # 使用 parfive 批量下载所有文件
+            files_to_download = [
+                (f.file_id, os.path.join(save_dir, f.filename))
+                for f in status.files
+            ]
+            if show_progress:
+                print(f"开始下载 {len(files_to_download)} 个文件...")
+            return self.download_files(files_to_download, show_progress)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            if task_id:
+                if show_progress:
+                    print(f"\n检测到中断，正在取消任务 {task_id}...")
+                try:
+                    await self.cancel_task(task_id)
+                    if show_progress:
+                        print(f"任务 {task_id} 已取消")
+                except Exception:
+                    pass
+            raise
 
     async def batch_download(
         self, urls: list[str], params: Optional[dict] = None, show_progress: bool = True
     ) -> list[TaskStatus]:
-        """批量创建任务并等待全部完成"""
-        tasks = [await self.create_task(url, params) for url in urls]
-        task_ids = [t[0] for t in tasks]
+        """批量创建任务并等待全部完成。支持 Ctrl+C 取消所有任务。"""
+        task_ids = []
+        try:
+            tasks = [await self.create_task(url, params) for url in urls]
+            task_ids = [t[0] for t in tasks]
 
-        if show_progress:
-            print(f"创建了 {len(task_ids)} 个任务")
-
-        while True:
-            statuses = await asyncio.gather(*[self.get_task(tid) for tid in task_ids])
             if show_progress:
-                done = sum(1 for s in statuses if s.is_done)
-                downloading = sum(1 for s in statuses if s.status == "downloading")
-                print(f"\r完成: {done}/{len(statuses)} | 下载中: {downloading}", end="")
-            if all(s.is_done for s in statuses):
+                print(f"创建了 {len(task_ids)} 个任务")
+
+            while True:
+                statuses = await asyncio.gather(*[self.get_task(tid) for tid in task_ids])
                 if show_progress:
-                    print()
-                return statuses
-            await asyncio.sleep(1)
+                    done = sum(1 for s in statuses if s.is_done)
+                    downloading = sum(1 for s in statuses if s.status == "downloading")
+                    print(f"\r完成: {done}/{len(statuses)} | 下载中: {downloading}", end="")
+                if all(s.is_done for s in statuses):
+                    if show_progress:
+                        print()
+                    return statuses
+                await asyncio.sleep(1)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            if task_ids and show_progress:
+                print(f"\n检测到中断，正在取消 {len(task_ids)} 个任务...")
+            for tid in task_ids:
+                try:
+                    await self.cancel_task(tid)
+                except Exception:
+                    pass
+            if show_progress:
+                print("所有任务已取消")
+            raise
 
 
 # ============ 使用示例 ============
