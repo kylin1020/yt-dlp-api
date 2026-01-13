@@ -5,7 +5,9 @@ yt-dlp API 异步客户端 SDK
 
 import asyncio
 import os
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -185,36 +187,63 @@ class AsyncYtDlpClient:
         return data["message"]
 
     async def download_file(self, file_id: str, save_path: str, show_progress: bool = True) -> str:
-        """使用 parfive 下载单个文件到本地"""
+        """使用 parfive 下载单个文件到本地（先下载到临时目录再移动）"""
         url = f"{self.base_url}/download/{file_id}"
-        save_dir = os.path.dirname(save_path) or "."
         filename = os.path.basename(save_path)
 
-        dl = Downloader(max_conn=1, progress=show_progress)
-        dl.enqueue_file(url, path=save_dir, filename=filename)
-        results = dl.download()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dl = Downloader(max_conn=1, progress=show_progress)
+            dl.enqueue_file(url, path=tmp_dir, filename=filename)
+            results = dl.download()
 
-        if results.errors:
-            raise FileDownloadError(filename, results.errors)
+            if results.errors:
+                raise FileDownloadError(filename, results.errors)
+
+            tmp_path = os.path.join(tmp_dir, filename)
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            shutil.move(tmp_path, save_path)
         return save_path
 
     def download_files(
-        self, files: list[tuple[str, str]], show_progress: bool = True
+        self, files: list[tuple[str, str]], show_progress: bool = True,
+        max_retries: int = 3
     ) -> list[str]:
         """
         批量下载文件（同步方法，带进度显示）
         files: [(file_id, save_path), ...]
+        先下载到临时目录，全部完成后再移动到目标位置
         """
-        dl = Downloader(max_conn=self.download_concurrent, progress=show_progress)
-        for file_id, save_path in files:
-            url = f"{self.base_url}/download/{file_id}"
-            save_dir = os.path.dirname(save_path) or "."
-            filename = os.path.basename(save_path)
-            dl.enqueue_file(url, path=save_dir, filename=filename)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_files = []
+            pending = []
+            for file_id, save_path in files:
+                url = f"{self.base_url}/download/{file_id}"
+                filename = os.path.basename(save_path)
+                tmp_files.append((os.path.join(tmp_dir, filename), save_path))
+                pending.append((url, tmp_dir, filename))
 
-        results = dl.download()
-        if results.errors:
-            raise FileDownloadError("batch", results.errors)
+            for attempt in range(max_retries):
+                dl = Downloader(max_conn=self.download_concurrent, progress=show_progress)
+                for url, path, filename in pending:
+                    dl.enqueue_file(url, path=path, filename=filename)
+                results = dl.download()
+
+                if not results.errors:
+                    break
+                # 筛选失败的文件重试
+                failed_urls = {str(e.url) for e in results.errors}
+                pending = [(u, p, f) for u, p, f in pending if u in failed_urls]
+                if show_progress:
+                    print(f"\n重试 {len(pending)} 个失败文件 ({attempt + 1}/{max_retries})...")
+            else:
+                if results.errors:
+                    raise FileDownloadError("batch", results.errors)
+
+            # 全部下载成功后移动到目标位置
+            for tmp_path, save_path in tmp_files:
+                os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+                shutil.move(tmp_path, save_path)
+
         return [save_path for _, save_path in files]
 
     async def get_max_concurrent(self) -> tuple[int, int]:
