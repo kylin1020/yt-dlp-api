@@ -27,6 +27,7 @@ fi
 # 检查并安装 deno
 if ! command -v deno &> /dev/null; then
     echo "安装 deno..."
+    apt install -y unzip
     curl -fsSL https://deno.land/install.sh | sh
     export PATH="$HOME/.deno/bin:$PATH"
 fi
