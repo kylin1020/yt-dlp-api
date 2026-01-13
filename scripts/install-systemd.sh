@@ -28,7 +28,7 @@ fi
 if [ ! -d "$PROJECT_DIR/.venv" ]; then
     echo "安装 Python 依赖..."
     cd "$PROJECT_DIR"
-    sudo -u "$REAL_USER" uv sync
+    uv sync
 fi
 
 # 生成 service 文件
