@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -43,6 +45,9 @@ CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "60"))
 # 运行时状态（不持久化）
 runtime_state: dict[str, dict] = {}  # task_id -> {progress, speed, total_bytes}
 
+# 带宽监控
+bandwidth_stats = {"total_bytes": 0, "last_reset": time.time()}
+
 
 def init_db():
     """初始化数据库"""
@@ -60,6 +65,14 @@ def init_db():
                 url TEXT,
                 params TEXT,
                 created_at REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS file_mapping (
+                file_id TEXT PRIMARY KEY,
+                task_id TEXT,
+                filename TEXT,
+                filepath TEXT
             )
         """)
 
@@ -116,6 +129,7 @@ def db_update_status(task_id: str, status: str, **kwargs):
 def db_delete_task(task_id: str):
     """从数据库删除任务"""
     with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM file_mapping WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
 
 
@@ -145,6 +159,30 @@ def db_get_all_task_ids() -> set[str]:
     """获取所有任务ID"""
     with db_lock, sqlite3.connect(DB_PATH) as conn:
         return {r[0] for r in conn.execute("SELECT task_id FROM tasks").fetchall()}
+
+
+def db_save_file_mapping(file_id: str, task_id: str, filename: str, filepath: str):
+    """保存文件映射"""
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO file_mapping (file_id, task_id, filename, filepath) VALUES (?, ?, ?, ?)",
+            (file_id, task_id, filename, filepath)
+        )
+
+
+def db_get_file_mapping(file_id: str) -> dict | None:
+    """获取文件映射"""
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM file_mapping WHERE file_id = ?", (file_id,)).fetchone()
+        if not row:
+            return None
+        return {"task_id": row["task_id"], "filename": row["filename"], "filepath": row["filepath"]}
+
+
+def generate_file_id(task_id: str, filename: str) -> str:
+    """生成文件ID（基于task_id和filename的hash）"""
+    return hashlib.md5(f"{task_id}:{filename}".encode()).hexdigest()
 
 
 def try_start_pending():
@@ -285,10 +323,16 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
 
         files = list(task_dir.iterdir())
         if files:
-            file_list = [
-                {"filename": f.name, "size": f.stat().st_size, "download_url": f"/download/{task_id}/{f.name}"}
-                for f in files if f.is_file()
-            ]
+            file_list = []
+            for f in files:
+                if f.is_file():
+                    file_id = generate_file_id(task_id, f.name)
+                    db_save_file_mapping(file_id, task_id, f.name, str(f))
+                    file_list.append({
+                        "filename": f.name,
+                        "size": f.stat().st_size,
+                        "download_url": f"/download/{file_id}"
+                    })
             total_size = sum(f.stat().st_size for f in files if f.is_file())
             elapsed = time.time() - started_at
             if elapsed > 0 and total_size > 0:
@@ -362,25 +406,22 @@ async def get_task_status(task_id: str):
     )
 
 
-@app.get("/download/{task_id}/{filename:path}")
-async def download_file(task_id: str, filename: str):
+@app.get("/download/{file_id}")
+async def download_file(file_id: str):
     """下载文件"""
-    task = db_get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-
-    if task["status"] != "completed":
-        raise HTTPException(status_code=400, detail="任务未完成")
-
-    task_dir = task.get("task_dir")
-    if not task_dir:
+    mapping = db_get_file_mapping(file_id)
+    if not mapping:
         raise HTTPException(status_code=404, detail="文件不存在")
 
-    filepath = Path(task_dir) / filename
+    task = db_get_task(mapping["task_id"])
+    if not task or task["status"] != "completed":
+        raise HTTPException(status_code=400, detail="任务未完成")
+
+    filepath = Path(mapping["filepath"])
     if not filepath.exists() or not filepath.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
 
-    return FileResponse(str(filepath), filename=filename, media_type="application/octet-stream")
+    return FileResponse(str(filepath), filename=mapping["filename"], media_type="application/octet-stream")
 
 
 @app.delete("/tasks/{task_id}")
@@ -397,6 +438,42 @@ async def delete_task(task_id: str):
     db_delete_task(task_id)
     runtime_state.pop(task_id, None)
     return {"message": "任务已删除"}
+
+
+@app.get("/settings/max-concurrent")
+async def get_max_concurrent():
+    """获取当前最大并发数"""
+    return {"max_concurrent": MAX_CONCURRENT, "active_count": active_count}
+
+
+@app.put("/settings/max-concurrent")
+async def set_max_concurrent(value: int):
+    """设置最大并发数"""
+    global MAX_CONCURRENT
+    if value < 1:
+        raise HTTPException(status_code=400, detail="最大并发数必须大于0")
+    MAX_CONCURRENT = value
+    try_start_pending()
+    return {"max_concurrent": MAX_CONCURRENT}
+
+
+@app.get("/monitor")
+async def get_monitor():
+    """获取系统监控信息"""
+    disk = shutil.disk_usage(TEMP_BASE_DIR)
+    total_speed = sum(rt.get("speed", 0) for rt in runtime_state.values())
+    return {
+        "disk": {
+            "total": format_size(disk.total),
+            "used": format_size(disk.used),
+            "free": format_size(disk.free),
+            "percent": round(disk.used / disk.total * 100, 1),
+        },
+        "bandwidth": {
+            "current_speed": format_size(total_speed) + "/s",
+            "active_downloads": active_count,
+        },
+    }
 
 
 if __name__ == "__main__":
