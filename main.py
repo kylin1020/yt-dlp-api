@@ -273,6 +273,7 @@ class TaskStatus(BaseModel):
     progress: float | None = None
     speed: str | None = None
     total_size: str | None = None
+    eta: str | None = None  # 预估剩余时间
     error: str | None = None
     files: list[FileInfo] | None = None
     info: dict[str, Any] | None = None
@@ -289,6 +290,17 @@ def format_size(bytes_val: float) -> str:
     return f"{bytes_val:.0f} B"
 
 
+def format_eta(seconds: float) -> str:
+    """格式化剩余时间"""
+    if seconds < 60:
+        return f"{int(seconds)}秒"
+    elif seconds < 3600:
+        return f"{int(seconds // 60)}分{int(seconds % 60)}秒"
+    else:
+        h, m = divmod(int(seconds), 3600)
+        return f"{h}时{m // 60}分"
+
+
 def progress_hook(task_id: str):
     def hook(d: dict):
         # 检查是否被取消
@@ -303,6 +315,7 @@ def progress_hook(task_id: str):
             if total > 0:
                 runtime_state[task_id]["progress"] = (downloaded / total) * 100
                 runtime_state[task_id]["total_bytes"] = total
+                runtime_state[task_id]["downloaded_bytes"] = downloaded
             if speed:
                 runtime_state[task_id]["speed"] = speed
         elif d["status"] == "finished":
@@ -418,11 +431,20 @@ async def get_task_status(task_id: str):
     rt = runtime_state.get(task_id, {})
     progress = rt.get("progress", task.get("progress"))
     speed = None
-    if rt.get("speed"):
-        speed = format_size(rt["speed"]) + "/s"
+    speed_val = rt.get("speed")
+    if speed_val:
+        speed = format_size(speed_val) + "/s"
     total_size = None
-    if rt.get("total_bytes"):
-        total_size = format_size(rt["total_bytes"])
+    total_bytes = rt.get("total_bytes")
+    if total_bytes:
+        total_size = format_size(total_bytes)
+
+    # 计算 ETA
+    eta = None
+    downloaded = rt.get("downloaded_bytes", 0)
+    if speed_val and total_bytes and downloaded < total_bytes:
+        remaining = total_bytes - downloaded
+        eta = format_eta(remaining / speed_val)
 
     return TaskStatus(
         task_id=task_id,
@@ -430,6 +452,7 @@ async def get_task_status(task_id: str):
         progress=progress,
         speed=speed,
         total_size=total_size,
+        eta=eta,
         error=task.get("error"),
         files=files,
         info=task.get("info"),
@@ -516,6 +539,17 @@ async def get_monitor():
     """获取系统监控信息"""
     disk = shutil.disk_usage(TEMP_BASE_DIR)
     total_speed = sum(rt.get("speed", 0) for rt in runtime_state.values())
+
+    # 计算预估空闲时间（所有任务中最长的剩余时间）
+    max_eta_seconds = 0
+    for rt in runtime_state.values():
+        speed = rt.get("speed", 0)
+        total = rt.get("total_bytes", 0)
+        downloaded = rt.get("downloaded_bytes", 0)
+        if speed > 0 and total > downloaded:
+            eta_seconds = (total - downloaded) / speed
+            max_eta_seconds = max(max_eta_seconds, eta_seconds)
+
     return {
         "disk": {
             "total": format_size(disk.total),
@@ -527,6 +561,7 @@ async def get_monitor():
             "current_speed": format_size(total_speed) + "/s",
             "active_downloads": active_count,
             "max_concurrent": MAX_CONCURRENT,
+            "estimated_idle": format_eta(max_eta_seconds) if max_eta_seconds > 0 else "空闲",
         },
     }
 
