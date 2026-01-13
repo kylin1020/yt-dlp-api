@@ -8,6 +8,10 @@ from shutil import rmtree
 from threading import Lock
 from typing import Any
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from fastapi.responses import FileResponse
@@ -143,7 +147,7 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
 @app.post("/tasks", response_model=TaskResponse)
 async def create_task(request: DownloadRequest):
     """创建下载任务"""
-    global active_countgi
+    global active_count
 
     with count_lock:
         if active_count >= MAX_CONCURRENT:
