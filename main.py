@@ -28,7 +28,7 @@ TEMP_BASE_DIR = Path(os.getenv("TEMP_DIR", "/tmp/yt-dlp-downloads"))
 TEMP_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 并发控制
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
 executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
 active_count = 0
 count_lock = Lock()
