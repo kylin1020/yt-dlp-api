@@ -12,6 +12,7 @@ from shutil import rmtree
 from threading import Lock
 from typing import Any
 
+import psutil
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -48,6 +49,9 @@ cancelled_tasks: set[str] = set()  # 被取消的任务ID
 
 # 带宽监控
 bandwidth_stats = {"total_bytes": 0, "last_reset": time.time()}
+
+# 网络速度监控
+net_stats = {"last_bytes": 0, "last_time": 0.0, "speed": 0.0}
 
 
 def init_db():
@@ -338,7 +342,7 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
         "nocheckcertificate": True,
         "concurrent_fragment_downloads": 8,
         "outtmpl": str(task_dir / "%(title).100s.%(ext)s"),
-        "progress_hooks": [progress_hook(task_id)],
+        "progress_hooks": [progress_hook(task_id)]
     }
 
     if user_params:
@@ -538,7 +542,21 @@ async def set_max_concurrent(value: int):
 async def get_monitor():
     """获取系统监控信息"""
     disk = shutil.disk_usage(TEMP_BASE_DIR)
-    total_speed = sum(rt.get("speed", 0) for rt in runtime_state.values())
+
+    # 使用 psutil 获取系统网络速度
+    net_io = psutil.net_io_counters()
+    current_bytes = net_io.bytes_recv
+    current_time = time.time()
+
+    speed = 0.0
+    if net_stats["last_time"] > 0:
+        time_diff = current_time - net_stats["last_time"]
+        if time_diff > 0:
+            speed = (current_bytes - net_stats["last_bytes"]) / time_diff
+
+    net_stats["last_bytes"] = current_bytes
+    net_stats["last_time"] = current_time
+    net_stats["speed"] = speed
 
     # 计算预估空闲时间（所有任务中最长的剩余时间）
     max_eta_seconds = 0
@@ -558,7 +576,7 @@ async def get_monitor():
             "percent": round(disk.used / disk.total * 100, 1),
         },
         "bandwidth": {
-            "current_speed": format_size(total_speed) + "/s",
+            "current_speed": format_size(speed) + "/s",
             "active_downloads": active_count,
             "max_concurrent": MAX_CONCURRENT,
             "estimated_idle": format_eta(max_eta_seconds) if max_eta_seconds > 0 else "空闲",
