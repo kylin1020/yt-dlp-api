@@ -44,6 +44,7 @@ CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "60"))
 
 # 运行时状态（不持久化）
 runtime_state: dict[str, dict] = {}  # task_id -> {progress, speed, total_bytes}
+cancelled_tasks: set[str] = set()  # 被取消的任务ID
 
 # 带宽监控
 bandwidth_stats = {"total_bytes": 0, "last_reset": time.time()}
@@ -180,6 +181,16 @@ def db_get_file_mapping(file_id: str) -> dict | None:
         return {"task_id": row["task_id"], "filename": row["filename"], "filepath": row["filepath"]}
 
 
+def db_find_active_task_by_url(url: str) -> str | None:
+    """查找相同URL的活跃任务（pending或downloading状态）"""
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT task_id FROM tasks WHERE url = ? AND status IN ('pending', 'downloading')",
+            (url,)
+        ).fetchone()
+        return row[0] if row else None
+
+
 def generate_file_id(task_id: str, filename: str) -> str:
     """生成文件ID（基于task_id和filename的hash）"""
     return hashlib.md5(f"{task_id}:{filename}".encode()).hexdigest()
@@ -243,6 +254,7 @@ class DownloadRequest(BaseModel):
 
 class TaskResponse(BaseModel):
     task_id: str
+    existed: bool = False
 
 
 class FileInfo(BaseModel):
@@ -275,6 +287,9 @@ def format_size(bytes_val: float) -> str:
 
 def progress_hook(task_id: str):
     def hook(d: dict):
+        # 检查是否被取消
+        if task_id in cancelled_tasks:
+            raise Exception("任务已取消")
         if task_id not in runtime_state:
             runtime_state[task_id] = {}
         if d["status"] == "downloading":
@@ -342,7 +357,13 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
         else:
             db_update_status(task_id, "failed", error="下载完成但未找到文件", finished_at=time.time())
     except Exception as e:
-        db_update_status(task_id, "failed", error=str(e), finished_at=time.time())
+        if task_id in cancelled_tasks:
+            db_update_status(task_id, "cancelled", finished_at=time.time())
+            cancelled_tasks.discard(task_id)
+            if task_dir.exists():
+                rmtree(task_dir)
+        else:
+            db_update_status(task_id, "failed", error=str(e), finished_at=time.time())
     finally:
         with count_lock:
             active_count -= 1
@@ -353,6 +374,11 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
 async def create_task(request: DownloadRequest):
     """创建下载任务"""
     global active_count
+
+    # 检查是否已存在相同URL的活跃任务
+    existing_task_id = db_find_active_task_by_url(request.url)
+    if existing_task_id:
+        return TaskResponse(task_id=existing_task_id, existed=True)
 
     task_id = str(uuid.uuid4())
     task = {
@@ -437,7 +463,31 @@ async def delete_task(task_id: str):
 
     db_delete_task(task_id)
     runtime_state.pop(task_id, None)
+    cancelled_tasks.discard(task_id)
     return {"message": "任务已删除"}
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """取消任务"""
+    task = db_get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    status = task["status"]
+    if status in ("completed", "failed", "cancelled"):
+        raise HTTPException(status_code=400, detail=f"任务已{status}，无法取消")
+
+    # 标记为取消
+    cancelled_tasks.add(task_id)
+
+    if status == "pending":
+        # pending状态直接更新数据库
+        db_update_status(task_id, "cancelled", finished_at=time.time())
+        cancelled_tasks.discard(task_id)
+    # downloading状态会在progress_hook中抛出异常
+
+    return {"message": "任务取消请求已提交"}
 
 
 @app.get("/settings/max-concurrent")
