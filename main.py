@@ -65,9 +65,11 @@ def init_db():
                 info TEXT,
                 url TEXT,
                 params TEXT,
-                created_at REAL
+                created_at REAL,
+                format TEXT
             )
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_url_format_status ON tasks(url, format, status)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS file_mapping (
                 file_id TEXT PRIMARY KEY,
@@ -104,13 +106,14 @@ def db_save_task(task_id: str, task: dict):
     info_json = json.dumps(task.get("info")) if task.get("info") else None
     files_json = json.dumps(task.get("files")) if task.get("files") else None
     params_json = json.dumps(task.get("params")) if task.get("params") else None
+    format_val = (task.get("params") or {}).get("format")
     with db_lock, sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
-            INSERT OR REPLACE INTO tasks (task_id, status, progress, error, task_dir, finished_at, files, info, url, params, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO tasks (task_id, status, progress, error, task_dir, finished_at, files, info, url, params, created_at, format)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (task_id, task.get("status"), task.get("progress"), task.get("error"),
               task.get("task_dir"), task.get("finished_at"), files_json, info_json,
-              task.get("url"), params_json, task.get("created_at")))
+              task.get("url"), params_json, task.get("created_at"), format_val))
 
 
 def db_update_status(task_id: str, status: str, **kwargs):
@@ -181,12 +184,13 @@ def db_get_file_mapping(file_id: str) -> dict | None:
         return {"task_id": row["task_id"], "filename": row["filename"], "filepath": row["filepath"]}
 
 
-def db_find_active_task_by_url(url: str) -> str | None:
-    """查找相同URL的活跃任务（pending或downloading状态）"""
+def db_find_reusable_task(url: str, params: dict | None) -> str | None:
+    """查找可复用的任务（相同URL和format参数）"""
+    format_val = (params or {}).get("format")
     with db_lock, sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT task_id FROM tasks WHERE url = ? AND status IN ('pending', 'downloading')",
-            (url,)
+            "SELECT task_id FROM tasks WHERE url = ? AND format IS ? AND status IN ('pending', 'downloading', 'completed')",
+            (url, format_val)
         ).fetchone()
         return row[0] if row else None
 
@@ -375,8 +379,8 @@ async def create_task(request: DownloadRequest):
     """创建下载任务"""
     global active_count
 
-    # 检查是否已存在相同URL的活跃任务
-    existing_task_id = db_find_active_task_by_url(request.url)
+    # 检查是否已存在可复用的任务（相同URL和format）
+    existing_task_id = db_find_reusable_task(request.url, request.params)
     if existing_task_id:
         return TaskResponse(task_id=existing_task_id, existed=True)
 

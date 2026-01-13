@@ -4,11 +4,67 @@ yt-dlp API 异步客户端 SDK
 """
 
 import asyncio
+import os
 import sys
-import httpx
-from typing import Optional
 from dataclasses import dataclass, field
+from typing import Optional
 
+import httpx
+from parfive import Downloader
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+
+# ============ 异常定义 ============
+
+class YtDlpClientError(Exception):
+    """客户端基础异常"""
+    pass
+
+
+class TaskNotFoundError(YtDlpClientError):
+    """任务不存在"""
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(f"任务不存在: {task_id}")
+
+
+class TaskFailedError(YtDlpClientError):
+    """任务执行失败"""
+    def __init__(self, task_id: str, error: str):
+        self.task_id = task_id
+        self.error = error
+        super().__init__(f"任务失败 [{task_id}]: {error}")
+
+
+class TaskCancelledError(YtDlpClientError):
+    """任务已取消"""
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(f"任务已取消: {task_id}")
+
+
+class ApiError(YtDlpClientError):
+    """API请求错误"""
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(f"API错误 [{status_code}]: {message}")
+
+
+class FileDownloadError(YtDlpClientError):
+    """文件下载失败"""
+    def __init__(self, filename: str, errors: list):
+        self.filename = filename
+        self.errors = errors
+        super().__init__(f"文件下载失败 [{filename}]: {errors}")
+
+
+class NetworkError(YtDlpClientError):
+    """网络请求错误（可重试）"""
+    pass
+
+
+# ============ 数据模型 ============
 
 @dataclass
 class TaskFile:
@@ -28,8 +84,13 @@ class TaskStatus:
     speed: str = ""
     total_size: str = ""
     error: str = ""
-    files: list = field(default_factory=list)
-    info: dict = None
+    files: list[TaskFile] = field(default_factory=list)
+    info: Optional[dict] = None
+
+    _STATUS_MAP = {
+        "pending": "等待中", "downloading": "下载中", "completed": "已完成",
+        "failed": "失败", "cancelled": "已取消"
+    }
 
     @property
     def is_done(self) -> bool:
@@ -37,49 +98,73 @@ class TaskStatus:
 
     @property
     def status_text(self) -> str:
-        return {"pending": "等待中", "downloading": "下载中", "completed": "已完成",
-                "failed": "失败", "cancelled": "已取消"}.get(self.status, self.status)
+        return self._STATUS_MAP.get(self.status, self.status)
 
+
+# ============ 客户端 ============
 
 class AsyncYtDlpClient:
     """yt-dlp API 异步客户端"""
 
-    def __init__(self, base_url: str = "http://localhost:8000"):
+    DEFAULT_DOWNLOAD_CONCURRENT = 2  # 文件下载默认并发数，避免占满带宽
+
+    def __init__(self, base_url: str = "http://localhost:8000", timeout: float = 30.0,
+                 download_concurrent: int = 2):
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.download_concurrent = download_concurrent
         self._client: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self):
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=self.timeout)
         return self
 
     async def __aexit__(self, *args):
-        if self._client:
-            await self._client.aclose()
+        await self.close()
 
     @property
     def client(self) -> httpx.AsyncClient:
         if not self._client:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=self.timeout)
         return self._client
 
-    async def create_task(self, url: str, params: dict = None) -> tuple[str, bool]:
+    async def close(self):
+        """关闭客户端连接"""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(NetworkError),
+        reraise=True
+    )
+    async def _request(self, method: str, path: str, **kwargs) -> dict:
+        """统一请求处理（自动重试网络错误）"""
+        try:
+            resp = await self.client.request(method, f"{self.base_url}{path}", **kwargs)
+            if resp.status_code == 404:
+                raise TaskNotFoundError(path.split("/")[-1])
+            if resp.status_code >= 500:
+                raise NetworkError(f"服务器错误 [{resp.status_code}]")
+            if resp.status_code >= 400:
+                detail = resp.json().get("detail", resp.text) if resp.text else "未知错误"
+                raise ApiError(resp.status_code, detail)
+            return resp.json()
+        except httpx.RequestError as e:
+            raise NetworkError(f"网络请求失败: {e}") from e
+
+    async def create_task(self, url: str, params: Optional[dict] = None) -> tuple[str, bool]:
         """创建下载任务，返回 (task_id, existed)"""
-        resp = await self.client.post(
-            f"{self.base_url}/tasks",
-            json={"url": url, "params": params or {}}
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        data = await self._request("POST", "/tasks", json={"url": url, "params": params or {}})
         return data["task_id"], data.get("existed", False)
 
     async def get_task(self, task_id: str) -> TaskStatus:
         """获取任务状态"""
-        resp = await self.client.get(f"{self.base_url}/tasks/{task_id}")
-        resp.raise_for_status()
-        data = resp.json()
+        data = await self._request("GET", f"/tasks/{task_id}")
         files = [
-            TaskFile(f["filename"], f["size"], f["download_url"],
-                     f["download_url"].split("/")[-1])
+            TaskFile(f["filename"], f["size"], f["download_url"], f["download_url"].split("/")[-1])
             for f in data.get("files") or []
         ]
         return TaskStatus(
@@ -91,50 +176,60 @@ class AsyncYtDlpClient:
 
     async def cancel_task(self, task_id: str) -> str:
         """取消任务"""
-        resp = await self.client.post(f"{self.base_url}/tasks/{task_id}/cancel")
-        resp.raise_for_status()
-        return resp.json()["message"]
+        data = await self._request("POST", f"/tasks/{task_id}/cancel")
+        return data["message"]
 
     async def delete_task(self, task_id: str) -> str:
         """删除任务"""
-        resp = await self.client.delete(f"{self.base_url}/tasks/{task_id}")
-        resp.raise_for_status()
-        return resp.json()["message"]
+        data = await self._request("DELETE", f"/tasks/{task_id}")
+        return data["message"]
 
-    async def download_file(self, file_id: str, save_path: str = None) -> str:
-        """下载文件到本地"""
-        async with self.client.stream("GET", f"{self.base_url}/download/{file_id}") as resp:
-            resp.raise_for_status()
-            filename = save_path
-            if not filename:
-                cd = resp.headers.get("content-disposition", "")
-                filename = cd.split("filename=")[-1].strip('"') if "filename=" in cd else file_id
-            with open(filename, "wb") as f:
-                async for chunk in resp.aiter_bytes(8192):
-                    f.write(chunk)
-        return filename
+    async def download_file(self, file_id: str, save_path: str, show_progress: bool = True) -> str:
+        """使用 parfive 下载单个文件到本地"""
+        url = f"{self.base_url}/download/{file_id}"
+        save_dir = os.path.dirname(save_path) or "."
+        filename = os.path.basename(save_path)
+
+        dl = Downloader(max_conn=1, progress=show_progress)
+        dl.enqueue_file(url, path=save_dir, filename=filename)
+        results = dl.download()
+
+        if results.errors:
+            raise FileDownloadError(filename, results.errors)
+        return save_path
+
+    def download_files(
+        self, files: list[tuple[str, str]], show_progress: bool = True
+    ) -> list[str]:
+        """
+        批量下载文件（同步方法，带进度显示）
+        files: [(file_id, save_path), ...]
+        """
+        dl = Downloader(max_conn=self.download_concurrent, progress=show_progress)
+        for file_id, save_path in files:
+            url = f"{self.base_url}/download/{file_id}"
+            save_dir = os.path.dirname(save_path) or "."
+            filename = os.path.basename(save_path)
+            dl.enqueue_file(url, path=save_dir, filename=filename)
+
+        results = dl.download()
+        if results.errors:
+            raise FileDownloadError("batch", results.errors)
+        return [save_path for _, save_path in files]
 
     async def get_max_concurrent(self) -> tuple[int, int]:
         """获取最大并发数和当前活跃数"""
-        resp = await self.client.get(f"{self.base_url}/settings/max-concurrent")
-        resp.raise_for_status()
-        data = resp.json()
+        data = await self._request("GET", "/settings/max-concurrent")
         return data["max_concurrent"], data["active_count"]
 
     async def set_max_concurrent(self, value: int) -> int:
         """设置最大并发数"""
-        resp = await self.client.put(
-            f"{self.base_url}/settings/max-concurrent",
-            json={"value": value}
-        )
-        resp.raise_for_status()
-        return resp.json()["max_concurrent"]
+        data = await self._request("PUT", "/settings/max-concurrent", json={"value": value})
+        return data["max_concurrent"]
 
     async def get_monitor(self) -> dict:
         """获取系统监控信息"""
-        resp = await self.client.get(f"{self.base_url}/monitor")
-        resp.raise_for_status()
-        return resp.json()
+        return await self._request("GET", "/monitor")
 
     async def wait_for_task(
         self, task_id: str, show_progress: bool = True, poll_interval: float = 1.0
@@ -163,7 +258,8 @@ class AsyncYtDlpClient:
         sys.stdout.flush()
 
     async def download(
-        self, url: str, params: dict = None, save_dir: str = ".", show_progress: bool = True
+        self, url: str, params: Optional[dict] = None,
+        save_dir: str = ".", show_progress: bool = True
     ) -> list[str]:
         """一站式下载：创建任务、等待完成、下载文件"""
         task_id, existed = await self.create_task(url, params)
@@ -173,22 +269,21 @@ class AsyncYtDlpClient:
         status = await self.wait_for_task(task_id, show_progress)
 
         if status.status == "failed":
-            raise Exception(f"下载失败: {status.error}")
+            raise TaskFailedError(task_id, status.error)
         if status.status == "cancelled":
-            raise Exception("任务已取消")
+            raise TaskCancelledError(task_id)
 
-        import os
-        saved_files = []
-        for f in status.files:
-            if show_progress:
-                print(f"保存文件: {f.filename}")
-            save_path = os.path.join(save_dir, f.filename)
-            await self.download_file(f.file_id, save_path)
-            saved_files.append(save_path)
-        return saved_files
+        # 使用 parfive 批量下载所有文件
+        files_to_download = [
+            (f.file_id, os.path.join(save_dir, f.filename))
+            for f in status.files
+        ]
+        if show_progress:
+            print(f"开始下载 {len(files_to_download)} 个文件...")
+        return self.download_files(files_to_download, show_progress)
 
     async def batch_download(
-        self, urls: list[str], params: dict = None, show_progress: bool = True
+        self, urls: list[str], params: Optional[dict] = None, show_progress: bool = True
     ) -> list[TaskStatus]:
         """批量创建任务并等待全部完成"""
         tasks = [await self.create_task(url, params) for url in urls]
@@ -209,31 +304,31 @@ class AsyncYtDlpClient:
                 return statuses
             await asyncio.sleep(1)
 
-    async def close(self):
-        """关闭客户端连接"""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
 
+# ============ 使用示例 ============
 
-# 使用示例
 if __name__ == "__main__":
     async def main():
         async with AsyncYtDlpClient("http://localhost:8000") as client:
-            # 示例1: 一站式下载
-            # files = await client.download("https://www.youtube.com/watch?v=xxx")
+            try:
+                # 一站式下载
+                # files = await client.download("https://www.youtube.com/watch?v=xxx")
 
-            # 示例2: 批量下载
-            # urls = ["https://...", "https://..."]
-            # statuses = await client.batch_download(urls)
+                # 批量下载
+                # statuses = await client.batch_download(["https://...", "https://..."])
 
-            # 示例3: 并发创建多个任务
-            # tasks = await asyncio.gather(
-            #     client.create_task("https://..."),
-            #     client.create_task("https://..."),
-            # )
+                monitor = await client.get_monitor()
+                print(f"磁盘可用: {monitor['disk']['free']}")
 
-            monitor = await client.get_monitor()
-            print(f"磁盘可用: {monitor['disk']['free']}")
+            except TaskFailedError as e:
+                print(f"下载失败: {e.error}")
+            except TaskCancelledError as e:
+                print(f"任务被取消: {e.task_id}")
+            except FileDownloadError as e:
+                print(f"文件下载失败: {e.filename} - {e.errors}")
+            except ApiError as e:
+                print(f"API错误 [{e.status_code}]: {e.message}")
+            except YtDlpClientError as e:
+                print(f"客户端错误: {e}")
 
     asyncio.run(main())

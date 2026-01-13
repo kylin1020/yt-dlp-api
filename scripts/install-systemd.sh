@@ -32,6 +32,12 @@ if ! command -v deno &> /dev/null; then
     export PATH="$HOME/.deno/bin:$PATH"
 fi
 
+# 检查并安装 ffmpeg
+if ! command -v ffmpeg &> /dev/null; then
+    echo "安装 ffmpeg..."
+    apt install -y ffmpeg
+fi
+
 # 检查并安装依赖
 if [ ! -d "$PROJECT_DIR/.venv" ]; then
     echo "安装 Python 依赖..."
