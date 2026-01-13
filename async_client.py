@@ -128,9 +128,9 @@ class AsyncYtDlpClient:
         retry_attempts: int = 3,
         cooldown_time: float = 5.0,
     ):
-        # 支持单个 URL 或 URL 列表
+        # 支持单个 URL、逗号分隔的字符串或 URL 列表
         if isinstance(base_urls, str):
-            base_urls = [base_urls]
+            base_urls = [u.strip() for u in base_urls.split(",")]
         self.base_urls = [url.rstrip("/") for url in base_urls]
         self.timeout = timeout
         self.download_concurrent = download_concurrent
