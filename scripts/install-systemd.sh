@@ -24,6 +24,13 @@ if ! command -v uv &> /dev/null; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
+# 检查并安装 deno
+if ! command -v deno &> /dev/null; then
+    echo "安装 deno..."
+    curl -fsSL https://deno.land/install.sh | sh
+    export PATH="$HOME/.deno/bin:$PATH"
+fi
+
 # 检查并安装依赖
 if [ ! -d "$PROJECT_DIR/.venv" ]; then
     echo "安装 Python 依赖..."
