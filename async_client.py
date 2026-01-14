@@ -176,10 +176,13 @@ class AsyncYtDlpClient:
         """获取一个可用的服务器（轮转方式实现负载均衡）"""
         now = time.time()
         n = len(self.base_urls)
-        for _ in range(n):
-            server = self.base_urls[self._round_robin_index % n]
-            self._round_robin_index = (self._round_robin_index + 1) % n
+        start_index = self._round_robin_index
+        for i in range(n):
+            idx = (start_index + i) % n
+            server = self.base_urls[idx]
             if self._server_cooldown.get(server, 0) <= now:
+                # 只有成功选中服务器后才更新索引，指向下一个位置
+                self._round_robin_index = (idx + 1) % n
                 return server
         return None
 
