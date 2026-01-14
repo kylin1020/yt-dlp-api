@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import os
 import shutil
@@ -55,8 +54,8 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "tasks.db"
 
-# 并发控制
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
+# 并发控制 - 注意：每个任务内部yt-dlp还会创建多个线程
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "8"))  # 默认8个并发任务
 active_count = 0
 
 # 下载工作器
@@ -188,12 +187,13 @@ def db_delete_task(task_id: str):
         conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
 
 
-def db_get_pending_tasks() -> list[tuple[str, str, dict | None]]:
+def db_get_pending_tasks(limit: int = 0) -> list[tuple[str, str, dict | None]]:
     with _get_db_conn() as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT task_id, url, params FROM tasks WHERE status = 'pending' ORDER BY created_at"
-        ).fetchall()
+        sql = "SELECT task_id, url, params FROM tasks WHERE status = 'pending' ORDER BY created_at"
+        if limit > 0:
+            sql += f" LIMIT {limit}"
+        rows = conn.execute(sql).fetchall()
         return [(r["task_id"], r["url"], json.loads(r["params"]) if r["params"] else None) for r in rows]
 
 
@@ -280,12 +280,30 @@ def on_progress(msg: dict):
     task_id = msg.get("task_id")
     if msg.get("type") == "done":
         active_count = max(0, active_count - 1)
+        runtime_state.pop(task_id, None)
+        # 任务完成后，尝试启动下一个pending任务
+        _try_start_next_pending()
     elif msg.get("type") == "progress":
         if task_id not in runtime_state:
             runtime_state[task_id] = {}
         for key in ("progress", "speed", "total_bytes", "downloaded_bytes"):
             if key in msg:
                 runtime_state[task_id][key] = msg[key]
+
+
+def _try_start_next_pending():
+    """尝试启动下一个pending任务"""
+    global active_count
+    if active_count >= MAX_CONCURRENT:
+        return
+    # 只查询需要的数量，避免查询大量数据
+    need = MAX_CONCURRENT - active_count
+    pending = db_get_pending_tasks(limit=need)
+    for task_id, url, params in pending:
+        if active_count >= MAX_CONCURRENT:
+            break
+        active_count += 1
+        download_worker.submit_task(task_id, url, params)
 
 
 @asynccontextmanager
@@ -303,11 +321,8 @@ async def lifespan(_app: FastAPI):
     download_worker.add_progress_callback(on_progress)
     download_worker.start()
 
-    # 启动pending任务
-    pending = db_get_pending_tasks()
-    for task_id, url, params in pending:
-        active_count += 1
-        download_worker.submit_task(task_id, url, params)
+    # 只启动MAX_CONCURRENT个pending任务，其他的等任务完成后再启动
+    _try_start_next_pending()
 
     cleanup_task = asyncio.create_task(cleanup_expired_tasks())
     yield

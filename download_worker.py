@@ -32,8 +32,8 @@ TEMP_BASE_DIR = Path(os.getenv("TEMP_DIR", "/tmp/yt-dlp-downloads"))
 DATA_DIR = Path(__file__).parent / "data"
 DB_PATH = DATA_DIR / "tasks.db"
 
-# 并发下载数
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
+# 并发下载数 - 默认8，每个任务内部还有分片线程
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "8"))
 
 # 全局状态
 _cancel_set: set[str] = set()
@@ -119,18 +119,18 @@ class DownloadWorker:
 
     def __init__(self, max_concurrent: int = MAX_CONCURRENT):
         self.max_concurrent = max_concurrent
-        self.semaphore = threading.BoundedSemaphore(max_concurrent)
-        self.executor = ThreadPoolExecutor(max_workers=256)
+        # 线程池大小直接等于最大并发数，不要设置过大
+        self.executor = ThreadPoolExecutor(max_workers=max_concurrent)
         self.task_queue: Queue = Queue()
         self.progress_callbacks: list = []
         self._running = False
         self._worker_thread: threading.Thread | None = None
 
     def set_max_concurrent(self, value: int):
-        """动态设置最大并发数"""
+        """动态设置最大并发数 - 需要重启才能生效"""
         if value > 0:
             self.max_concurrent = value
-            self.semaphore = threading.BoundedSemaphore(value)
+            # 注意：ThreadPoolExecutor不支持动态调整，需要重启服务才能生效
 
     def add_progress_callback(self, callback):
         """添加进度回调"""
@@ -164,7 +164,7 @@ class DownloadWorker:
         self.task_queue.put(None)  # 发送退出信号
         if self._worker_thread:
             self._worker_thread.join(timeout=5)
-        self.executor.shutdown(wait=False)
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
     def _run(self):
         """工作器主循环"""
@@ -176,19 +176,11 @@ class DownloadWorker:
                 task_id = msg["task_id"]
                 url = msg["url"]
                 params = msg.get("params")
-                self.executor.submit(self._download_with_semaphore, task_id, url, params)
+                self.executor.submit(self._download_single_task, task_id, url, params)
             except Empty:
                 continue
             except:
                 pass
-
-    def _download_with_semaphore(self, task_id: str, url: str, params: dict | None):
-        """带信号量控制的下载"""
-        self.semaphore.acquire()
-        try:
-            self._download_single_task(task_id, url, params)
-        finally:
-            self.semaphore.release()
 
     def _download_single_task(self, task_id: str, url: str, user_params: dict[str, Any] | None):
         """执行单个下载任务"""
@@ -229,7 +221,7 @@ class DownloadWorker:
             "retries": 5,
             "extractor_retries": 1,
             "nocheckcertificate": True,
-            "concurrent_fragment_downloads": 8,
+            "concurrent_fragment_downloads": 4,  # 降低分片并发，避免线程爆炸
             "outtmpl": str(task_dir / "%(title).100s.%(ext)s"),
             "progress_hooks": [progress_hook]
         }
