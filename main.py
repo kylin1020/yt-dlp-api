@@ -409,9 +409,17 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
 
                     # 如果启用了 R2，上传文件并返回 CDN 链接
                     if r2_client:
-                        object_key = f"{task_id}/{f.name}"
-                        r2_client.upload_file(str(f), R2_BUCKET_NAME, object_key, Config=r2_transfer_config)
-                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{task_id}/{quote(f.name)}"
+                        # 使用hash文件名存储，保留后缀
+                        ext = f.suffix
+                        hash_name = f"{file_id}{ext}"
+                        object_key = f"{task_id}/{hash_name}"
+                        # 设置Content-Disposition让下载时返回真实文件名
+                        r2_client.upload_file(
+                            str(f), R2_BUCKET_NAME, object_key,
+                            Config=r2_transfer_config,
+                            ExtraArgs={"ContentDisposition": f"attachment; filename*=UTF-8''{quote(f.name)}"}
+                        )
+                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
                         # 更新上传进度
                         runtime_state[task_id]["progress"] = ((idx + 1) / len([x for x in files if x.is_file()])) * 100
                     else:
