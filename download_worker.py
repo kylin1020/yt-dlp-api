@@ -243,7 +243,7 @@ class DownloadWorker:
             "extractor_retries": 1,
             "nocheckcertificate": True,
             "concurrent_fragment_downloads": 4,  # 降低分片并发，避免线程爆炸
-            "outtmpl": str(task_dir / "%(title).100s.%(ext)s"),
+            "outtmpl": str(task_dir / "%(id)s.%(ext)s"),
             "progress_hooks": [progress_hook]
         }
 
@@ -289,9 +289,7 @@ class DownloadWorker:
                     file_size = f.stat().st_size
 
                     if r2_client:
-                        ext = f.suffix
-                        hash_name = f"{file_id}{ext}"
-                        object_key = f"{task_id}/{hash_name}"
+                        object_key = f"{task_id}/{f.name}"
                         r2_client.upload_file(
                             str(f), R2_BUCKET_NAME, object_key,
                             Config=r2_transfer_config,
@@ -314,7 +312,7 @@ class DownloadWorker:
                         "download_url": download_url
                     })
 
-                total_size = sum(f.stat().st_size for f in valid_files)
+                total_size = sum(f["size"] for f in file_list)
                 elapsed = time.time() - started_at
                 if elapsed > 0 and total_size > 0:
                     self._notify_progress({
