@@ -1,17 +1,17 @@
 import asyncio
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import shutil
 import sqlite3
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Process, Queue
 from pathlib import Path
 from shutil import rmtree
 from threading import Lock
 from typing import Any
-from urllib.parse import quote
 
 import psutil
 from dotenv import load_dotenv
@@ -48,7 +48,6 @@ from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from yt_dlp import YoutubeDL
 
 # 临时文件目录
 TEMP_BASE_DIR = Path(os.getenv("TEMP_DIR", "/tmp/yt-dlp-downloads"))
@@ -61,10 +60,13 @@ DB_PATH = DATA_DIR / "tasks.db"
 
 # 并发控制
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
-executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
 active_count = 0
 count_lock = Lock()
-db_lock = Lock()
+
+# 子进程通信队列
+progress_queue: Queue = None
+cancel_set = None  # Manager().dict() 用于存储被取消的任务ID
+active_processes: dict[str, Process] = {}  # task_id -> Process
 
 # 任务清理配置（秒）
 TASK_EXPIRE_SECONDS = int(os.getenv("TASK_EXPIRE_SECONDS", "300"))
@@ -72,7 +74,6 @@ CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "60"))
 
 # 运行时状态（不持久化）
 runtime_state: dict[str, dict] = {}  # task_id -> {progress, speed, total_bytes}
-cancelled_tasks: set[str] = set()  # 被取消的任务ID
 
 # 带宽监控
 bandwidth_stats = {"total_bytes": 0, "last_reset": time.time()}
@@ -84,6 +85,8 @@ net_stats = {"last_bytes": 0, "last_time": 0.0, "speed": 0.0}
 def init_db():
     """初始化数据库"""
     with sqlite3.connect(DB_PATH) as conn:
+        # 启用 WAL 模式，提高多进程并发性能
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
@@ -117,9 +120,15 @@ def init_db():
             pass
 
 
+def _get_db_conn():
+    """获取数据库连接，设置 timeout 避免锁冲突"""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    return conn
+
+
 def db_get_task(task_id: str) -> dict | None:
     """从数据库获取单个任务"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
         if not row:
@@ -144,7 +153,7 @@ def db_save_task(task_id: str, task: dict):
     files_json = json.dumps(task.get("files")) if task.get("files") else None
     params_json = json.dumps(task.get("params")) if task.get("params") else None
     format_val = (task.get("params") or {}).get("format")
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO tasks (task_id, status, progress, error, task_dir, finished_at, files, info, url, params, created_at, format)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -155,7 +164,7 @@ def db_save_task(task_id: str, task: dict):
 
 def db_update_status(task_id: str, status: str, **kwargs):
     """更新任务状态"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         sets = ["status = ?"]
         values = [status]
         for k, v in kwargs.items():
@@ -169,14 +178,14 @@ def db_update_status(task_id: str, status: str, **kwargs):
 
 def db_delete_task(task_id: str):
     """从数据库删除任务"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.execute("DELETE FROM file_mapping WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
 
 
 def db_get_pending_tasks() -> list[tuple[str, str, dict | None]]:
     """获取所有等待中的任务，按创建时间排序"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT task_id, url, params FROM tasks WHERE status = 'pending' ORDER BY created_at"
@@ -187,7 +196,7 @@ def db_get_pending_tasks() -> list[tuple[str, str, dict | None]]:
 def db_get_expired_tasks() -> list[tuple[str, str | None]]:
     """获取过期的已完成/失败任务"""
     cutoff = time.time() - TASK_EXPIRE_SECONDS
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT task_id, task_dir FROM tasks WHERE status IN ('completed', 'failed') AND finished_at < ?",
@@ -198,13 +207,13 @@ def db_get_expired_tasks() -> list[tuple[str, str | None]]:
 
 def db_get_all_task_ids() -> set[str]:
     """获取所有任务ID"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         return {r[0] for r in conn.execute("SELECT task_id FROM tasks").fetchall()}
 
 
 def db_save_file_mapping(file_id: str, task_id: str, filename: str, filepath: str, r2_key: str = None):
     """保存文件映射"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO file_mapping (file_id, task_id, filename, filepath, r2_key) VALUES (?, ?, ?, ?, ?)",
             (file_id, task_id, filename, filepath, r2_key)
@@ -213,7 +222,7 @@ def db_save_file_mapping(file_id: str, task_id: str, filename: str, filepath: st
 
 def db_get_file_mapping(file_id: str) -> dict | None:
     """获取文件映射"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM file_mapping WHERE file_id = ?", (file_id,)).fetchone()
         if not row:
@@ -223,21 +232,21 @@ def db_get_file_mapping(file_id: str) -> dict | None:
 
 def db_get_r2_keys_by_task(task_id: str) -> list[str]:
     """获取任务的所有R2 keys"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         rows = conn.execute("SELECT r2_key FROM file_mapping WHERE task_id = ? AND r2_key IS NOT NULL", (task_id,)).fetchall()
         return [r[0] for r in rows]
 
 
 def db_delete_file_mappings_by_task(task_id: str):
     """删除任务的所有文件映射"""
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.execute("DELETE FROM file_mapping WHERE task_id = ?", (task_id,))
 
 
 def db_find_reusable_task(url: str, params: dict | None) -> str | None:
     """查找可复用的任务（相同URL和format参数）"""
     format_val = (params or {}).get("format")
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         row = conn.execute(
             "SELECT task_id FROM tasks WHERE url = ? AND format IS ? AND status IN ('pending', 'downloading', 'completed')",
             (url, format_val)
@@ -253,6 +262,7 @@ def generate_file_id(task_id: str, filename: str) -> str:
 def try_start_pending():
     """尝试启动等待中的任务"""
     global active_count
+    from download_worker import download_in_subprocess
     with count_lock:
         if active_count >= MAX_CONCURRENT:
             return
@@ -262,7 +272,9 @@ def try_start_pending():
             if active_count >= MAX_CONCURRENT:
                 break
             active_count += 1
-        executor.submit(download_task, task_id, url, params)
+        p = Process(target=download_in_subprocess, args=(task_id, url, params, progress_queue, cancel_set))
+        p.start()
+        active_processes[task_id] = p
 
 
 def _cleanup_task(task_id: str, task_dir: str | None):
@@ -300,17 +312,46 @@ def cleanup_orphan_dirs():
             rmtree(item)
 
 
+async def progress_listener():
+    """后台协程：监听子进程的进度更新"""
+    global active_count
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            msg = await loop.run_in_executor(None, lambda: progress_queue.get(timeout=0.1))
+            task_id = msg.get("task_id")
+            if msg.get("type") == "done":
+                with count_lock:
+                    active_count -= 1
+                active_processes.pop(task_id, None)
+                try_start_pending()
+            elif msg.get("type") == "progress":
+                if task_id not in runtime_state:
+                    runtime_state[task_id] = {}
+                for key in ("progress", "speed", "total_bytes", "downloaded_bytes"):
+                    if key in msg:
+                        runtime_state[task_id][key] = msg[key]
+        except:
+            await asyncio.sleep(0.05)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global progress_queue, cancel_set
+    manager = mp.Manager()
+    progress_queue = manager.Queue()
+    cancel_set = manager.dict()
     init_db()
     # 将 downloading/uploading 状态重置为 pending（服务重启时恢复）
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
+    with _get_db_conn() as conn:
         conn.execute("UPDATE tasks SET status = 'pending', progress = 0 WHERE status IN ('downloading', 'uploading')")
     cleanup_orphan_dirs()
     try_start_pending()
-    task = asyncio.create_task(cleanup_expired_tasks())
+    cleanup_task = asyncio.create_task(cleanup_expired_tasks())
+    progress_task = asyncio.create_task(progress_listener())
     yield
-    task.cancel()
+    cleanup_task.cancel()
+    progress_task.cancel()
 
 
 app = FastAPI(title="yt-dlp API", lifespan=lifespan)
@@ -366,124 +407,11 @@ def format_eta(seconds: float) -> str:
         return f"{h}时{m // 60}分"
 
 
-def progress_hook(task_id: str):
-    def hook(d: dict):
-        # 检查是否被取消
-        if task_id in cancelled_tasks:
-            raise Exception("任务已取消")
-        if task_id not in runtime_state:
-            runtime_state[task_id] = {}
-        if d["status"] == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
-            downloaded = d.get("downloaded_bytes", 0)
-            speed = d.get("speed")
-            if total > 0:
-                runtime_state[task_id]["progress"] = (downloaded / total) * 100
-                runtime_state[task_id]["total_bytes"] = total
-                runtime_state[task_id]["downloaded_bytes"] = downloaded
-            if speed:
-                runtime_state[task_id]["speed"] = speed
-        elif d["status"] == "finished":
-            runtime_state[task_id]["progress"] = 100
-    return hook
-
-
-def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
-    global active_count
-    task_dir = TEMP_BASE_DIR / task_id
-    task_dir.mkdir(parents=True, exist_ok=True)
-    runtime_state[task_id] = {"progress": 0}
-
-    db_update_status(task_id, "downloading", task_dir=str(task_dir))
-
-    base_params = {
-        "noplaylist": True,
-        "retries": 5,
-        "extractor_retries": 1,
-        "nocheckcertificate": True,
-        "concurrent_fragment_downloads": 8,
-        "outtmpl": str(task_dir / "%(title).100s.%(ext)s"),
-        "progress_hooks": [progress_hook(task_id)]
-    }
-
-    if user_params:
-        user_params.pop("outtmpl", None)
-        user_params.pop("progress_hooks", None)
-        base_params.update(user_params)
-
-    started_at = time.time()
-    info = None
-    try:
-        with YoutubeDL(base_params) as ydl:
-            extracted_info = ydl.extract_info(url, download=True)
-            info = ydl.sanitize_info(extracted_info)
-
-        files = list(task_dir.iterdir())
-        if files:
-            file_list = []
-            # 如果启用了 R2，先更新状态为 uploading
-            if r2_client:
-                db_update_status(task_id, "uploading")
-                runtime_state[task_id]["progress"] = 0
-            for idx, f in enumerate(files):
-                if f.is_file():
-                    file_id = generate_file_id(task_id, f.name)
-                    file_size = f.stat().st_size
-
-                    # 如果启用了 R2，上传文件并返回 CDN 链接
-                    if r2_client:
-                        # 使用hash文件名存储，保留后缀
-                        ext = f.suffix
-                        hash_name = f"{file_id}{ext}"
-                        object_key = f"{task_id}/{hash_name}"
-                        # 设置Content-Disposition让下载时返回真实文件名
-                        r2_client.upload_file(
-                            str(f), R2_BUCKET_NAME, object_key,
-                            Config=r2_transfer_config,
-                            ExtraArgs={"ContentDisposition": f"attachment; filename*=UTF-8''{quote(f.name)}"}
-                        )
-                        db_save_file_mapping(file_id, task_id, f.name, str(f), r2_key=object_key)
-                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
-                        # 更新上传进度
-                        runtime_state[task_id]["progress"] = ((idx + 1) / len([x for x in files if x.is_file()])) * 100
-                    else:
-                        db_save_file_mapping(file_id, task_id, f.name, str(f))
-                        download_url = f"/download/{file_id}"
-
-                    file_list.append({
-                        "filename": f.name,
-                        "size": file_size,
-                        "download_url": download_url
-                    })
-            total_size = sum(f.stat().st_size for f in files if f.is_file())
-            elapsed = time.time() - started_at
-            if elapsed > 0 and total_size > 0:
-                runtime_state[task_id]["speed"] = total_size / elapsed
-                runtime_state[task_id]["total_bytes"] = total_size
-            db_update_status(task_id, "completed", files=file_list, info=info, finished_at=time.time())
-            # R2 上传成功后删除本地文件
-            if r2_client and task_dir.exists():
-                rmtree(task_dir)
-        else:
-            db_update_status(task_id, "failed", error="下载完成但未找到文件", finished_at=time.time())
-    except Exception as e:
-        if task_id in cancelled_tasks:
-            db_update_status(task_id, "cancelled", finished_at=time.time())
-            cancelled_tasks.discard(task_id)
-            if task_dir.exists():
-                rmtree(task_dir)
-        else:
-            db_update_status(task_id, "failed", error=str(e), finished_at=time.time())
-    finally:
-        with count_lock:
-            active_count -= 1
-        try_start_pending()
-
-
 @app.post("/tasks", response_model=TaskResponse)
 async def create_task(request: DownloadRequest):
     """创建下载任务"""
     global active_count
+    from download_worker import download_in_subprocess
 
     # 检查是否已存在可复用的任务（相同URL和format）
     existing_task_id = db_find_reusable_task(request.url, request.params)
@@ -504,7 +432,9 @@ async def create_task(request: DownloadRequest):
     with count_lock:
         if active_count < MAX_CONCURRENT:
             active_count += 1
-            executor.submit(download_task, task_id, request.url, request.params)
+            p = Process(target=download_in_subprocess, args=(task_id, request.url, request.params, progress_queue, cancel_set))
+            p.start()
+            active_processes[task_id] = p
 
     return TaskResponse(task_id=task_id)
 
@@ -570,6 +500,21 @@ async def download_file(file_id: str):
     return FileResponse(str(filepath), filename=mapping["filename"], media_type="application/octet-stream")
 
 
+def _delete_task_sync(task_id: str, task_dir: str | None):
+    """同步删除任务（在线程池中执行）"""
+    if task_dir and Path(task_dir).exists():
+        rmtree(task_dir)
+    if r2_client:
+        try:
+            r2_keys = db_get_r2_keys_by_task(task_id)
+            if r2_keys:
+                r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
+        except Exception:
+            pass
+    db_delete_file_mappings_by_task(task_id)
+    db_delete_task(task_id)
+
+
 @app.delete("/tasks/{task_id}")
 async def delete_task(task_id: str):
     """删除任务及其临时文件"""
@@ -578,22 +523,9 @@ async def delete_task(task_id: str):
         raise HTTPException(status_code=404, detail="任务不存在")
 
     task_dir = task.get("task_dir")
-    if task_dir and Path(task_dir).exists():
-        rmtree(task_dir)
-
-    # 清理 R2 文件
-    if r2_client:
-        try:
-            r2_keys = db_get_r2_keys_by_task(task_id)
-            if r2_keys:
-                r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
-        except Exception:
-            pass
-
-    db_delete_file_mappings_by_task(task_id)
-    db_delete_task(task_id)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _delete_task_sync, task_id, task_dir)
     runtime_state.pop(task_id, None)
-    cancelled_tasks.discard(task_id)
     return {"message": "任务已删除"}
 
 
@@ -608,14 +540,11 @@ async def cancel_task(task_id: str):
     if status in ("completed", "failed", "cancelled"):
         raise HTTPException(status_code=400, detail=f"任务已{status}，无法取消")
 
-    # 标记为取消
-    cancelled_tasks.add(task_id)
-
     if status == "pending":
-        # pending状态直接更新数据库
         db_update_status(task_id, "cancelled", finished_at=time.time())
-        cancelled_tasks.discard(task_id)
-    # downloading状态会在progress_hook中抛出异常
+    else:
+        # 通知子进程取消
+        cancel_set[task_id] = True
 
     return {"message": "任务取消请求已提交"}
 
