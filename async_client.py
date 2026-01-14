@@ -428,11 +428,6 @@ class AsyncYtDlpClient:
                 print(f"开始下载 {len(files_to_download)} 个文件...")
             downloaded = await self.download_files(files_to_download, show_progress)
 
-            # 下载完成后删除任务，清理服务器上的文件
-            await self.delete_task(task_id)
-            if show_progress:
-                print(f"已删除服务器上的任务和文件: {task_id}")
-
             return status, downloaded
         except (KeyboardInterrupt, asyncio.CancelledError):
             if task_id:
