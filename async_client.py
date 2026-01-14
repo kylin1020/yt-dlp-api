@@ -82,7 +82,11 @@ class TaskFile:
     filename: str
     size: int
     download_url: str
-    file_id: str
+
+    @property
+    def is_external_url(self) -> bool:
+        """判断是否为外部 URL（如 R2 CDN 链接）"""
+        return self.download_url.startswith(("http://", "https://"))
 
 
 @dataclass
@@ -243,7 +247,7 @@ class AsyncYtDlpClient:
         """获取任务状态"""
         data = await self._request("GET", f"/tasks/{task_id}")
         files = [
-            TaskFile(f["filename"], f["size"], f["download_url"], f["download_url"].split("/")[-1])
+            TaskFile(f["filename"], f["size"], f["download_url"])
             for f in data.get("files") or []
         ]
         return TaskStatus(
@@ -293,41 +297,48 @@ class AsyncYtDlpClient:
     ) -> list[str]:
         """
         批量下载文件（异步方法，带进度显示）
-        files: [(file_id, save_path), ...]
+        files: [(url_or_file_id, save_path), ...]
+        如果是完整 URL 则直接下载，否则通过服务器 API 下载
         先下载到临时目录，全部完成后再移动到目标位置
-        支持多服务器故障转移
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_files = []
             pending = []
-            # 初始使用第一个可用服务器
             server = self._get_available_server() or self.base_urls[0]
-            for file_id, save_path in files:
-                url = f"{server}/download/{file_id}"
+
+            for url_or_id, save_path in files:
                 filename = os.path.basename(save_path)
-                tmp_files.append((os.path.join(tmp_dir, filename), save_path, file_id))
-                pending.append((url, tmp_dir, filename, file_id))
+                # 判断是完整 URL 还是 file_id
+                if url_or_id.startswith(("http://", "https://")):
+                    url = url_or_id
+                    is_external = True
+                else:
+                    url = f"{server}/download/{url_or_id}"
+                    is_external = False
+                tmp_files.append((os.path.join(tmp_dir, filename), save_path, url_or_id, is_external))
+                pending.append((url, tmp_dir, filename, url_or_id, is_external))
 
             for attempt in range(max_retries):
                 dl = Downloader(max_conn=self.download_concurrent, progress=show_progress)
-                for url, path, filename, _ in pending:
+                for url, path, filename, _, _ in pending:
                     dl.enqueue_file(url, path=path, filename=filename)
                 results = await dl.run_download()
 
                 if not results.errors:
                     break
 
-                # 标记当前服务器不可用，切换到其他服务器
+                # 标记当前服务器不可用，切换到其他服务器（仅对非外部 URL）
                 self._mark_server_unavailable(server)
                 server = self._get_available_server() or self.base_urls[0]
 
-                # 筛选失败的文件，用新服务器重试
+                # 筛选失败的文件重试
                 failed_urls = {str(e.url) for e in results.errors}
                 new_pending = []
-                for url, path, filename, file_id in pending:
+                for url, path, filename, url_or_id, is_external in pending:
                     if url in failed_urls:
-                        new_url = f"{server}/download/{file_id}"
-                        new_pending.append((new_url, path, filename, file_id))
+                        # 外部 URL 保持不变，内部 URL 切换服务器
+                        new_url = url if is_external else f"{server}/download/{url_or_id}"
+                        new_pending.append((new_url, path, filename, url_or_id, is_external))
                 pending = new_pending
 
                 if show_progress:
@@ -337,11 +348,11 @@ class AsyncYtDlpClient:
                     raise FileDownloadError("batch", results.errors)
 
             # 全部下载成功后移动到目标位置
-            for tmp_path, save_path, _ in tmp_files:
+            for tmp_path, save_path, _, _ in tmp_files:
                 os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
                 shutil.move(tmp_path, save_path)
 
-        return [save_path for _, save_path, _ in tmp_files]
+        return [save_path for _, save_path, _, _ in tmp_files]
 
     async def get_max_concurrent(self) -> tuple[int, int]:
         """获取最大并发数和当前活跃数"""
@@ -408,7 +419,7 @@ class AsyncYtDlpClient:
 
             # 使用 parfive 批量下载所有文件
             files_to_download = [
-                (f.file_id, os.path.join(save_dir, f.filename))
+                (f.download_url, os.path.join(save_dir, f.filename))
                 for f in status.files
             ]
             if show_progress:

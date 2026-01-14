@@ -17,6 +17,32 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# R2 配置
+R2_ENABLED = os.getenv("R2_ENABLED", "false").lower() == "true"
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "")
+R2_PUBLIC_DOMAIN = os.getenv("R2_PUBLIC_DOMAIN", "")  # 如 https://dl.yourdomain.com
+
+# 初始化 R2 客户端
+r2_client = None
+if R2_ENABLED and R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY and R2_BUCKET_NAME and R2_PUBLIC_DOMAIN:
+    import boto3
+    from boto3.s3.transfer import TransferConfig
+    r2_client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY,
+    )
+    r2_transfer_config = TransferConfig(
+        multipart_threshold=1024 * 1024 * 25,   # 25MB 开始分片
+        multipart_chunksize=1024 * 1024 * 256,  # 256MB 分片大小
+        max_concurrency=10,
+        use_threads=True
+    )
+
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from fastapi.responses import FileResponse
@@ -224,8 +250,19 @@ async def cleanup_expired_tasks():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL)
         for task_id, task_dir in db_get_expired_tasks():
+            # 清理本地文件
             if task_dir and Path(task_dir).exists():
                 rmtree(task_dir)
+            # 清理 R2 文件
+            if r2_client:
+                try:
+                    prefix = f"{task_id}/"
+                    resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+                    objects = [{"Key": obj["Key"]} for obj in resp.get("Contents", [])]
+                    if objects:
+                        r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
+                except Exception:
+                    pass
             db_delete_task(task_id)
             runtime_state.pop(task_id, None)
         try_start_pending()
@@ -363,11 +400,21 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
             for f in files:
                 if f.is_file():
                     file_id = generate_file_id(task_id, f.name)
-                    db_save_file_mapping(file_id, task_id, f.name, str(f))
+                    file_size = f.stat().st_size
+
+                    # 如果启用了 R2，上传文件并返回 CDN 链接
+                    if r2_client:
+                        object_key = f"{task_id}/{f.name}"
+                        r2_client.upload_file(str(f), R2_BUCKET_NAME, object_key, Config=r2_transfer_config)
+                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
+                    else:
+                        db_save_file_mapping(file_id, task_id, f.name, str(f))
+                        download_url = f"/download/{file_id}"
+
                     file_list.append({
                         "filename": f.name,
-                        "size": f.stat().st_size,
-                        "download_url": f"/download/{file_id}"
+                        "size": file_size,
+                        "download_url": download_url
                     })
             total_size = sum(f.stat().st_size for f in files if f.is_file())
             elapsed = time.time() - started_at
@@ -375,6 +422,9 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
                 runtime_state[task_id]["speed"] = total_size / elapsed
                 runtime_state[task_id]["total_bytes"] = total_size
             db_update_status(task_id, "completed", files=file_list, info=info, finished_at=time.time())
+            # R2 上传成功后删除本地文件
+            if r2_client and task_dir.exists():
+                rmtree(task_dir)
         else:
             db_update_status(task_id, "failed", error="下载完成但未找到文件", finished_at=time.time())
     except Exception as e:
