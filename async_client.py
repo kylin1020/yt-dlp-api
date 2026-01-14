@@ -129,7 +129,7 @@ class AsyncYtDlpClient:
         self,
         base_urls: Union[str, list[str]] = "http://localhost:8000",
         timeout: float = 30.0,
-        download_concurrent: int = 8,
+        download_concurrent: int = 4,
         retry_attempts: int = 3,
         cooldown_time: float = 5.0,
     ):
@@ -290,7 +290,7 @@ class AsyncYtDlpClient:
                 server = self._get_available_server() or self.base_urls[0]
                 url = f"{server}/download/{file_id}"
 
-                dl = Downloader(max_conn=1, progress=show_progress)
+                dl = Downloader(max_conn=self.download_concurrent, progress=show_progress)
                 dl.enqueue_file(url, path=tmp_dir, filename=filename)
                 results = dl.download()
 
