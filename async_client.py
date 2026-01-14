@@ -5,7 +5,6 @@ yt-dlp API 异步客户端 SDK
 
 import asyncio
 import os
-import random
 import shutil
 import sys
 import tempfile
@@ -146,6 +145,8 @@ class AsyncYtDlpClient:
         self._server_cooldown: dict[str, float] = {url: 0 for url in self.base_urls}
         # 任务亲和性：{task_id: server_url}，记录任务创建在哪个服务器
         self._task_server: dict[str, str] = {}
+        # 轮转索引
+        self._round_robin_index: int = 0
 
     @property
     def base_url(self) -> str:
@@ -172,10 +173,22 @@ class AsyncYtDlpClient:
             self._client = None
 
     def _get_available_server(self) -> Optional[str]:
-        """获取一个可用的服务器（随机选择以实现负载均衡）"""
+        """获取一个可用的服务器（轮转方式实现负载均衡）"""
         now = time.time()
-        available = [url for url, cooldown in self._server_cooldown.items() if cooldown <= now]
-        return random.choice(available) if available else None
+        n = len(self.base_urls)
+        for _ in range(n):
+            server = self.base_urls[self._round_robin_index % n]
+            self._round_robin_index = (self._round_robin_index + 1) % n
+            if self._server_cooldown.get(server, 0) <= now:
+                return server
+        return None
+
+    def get_server(self, preferred: str = None) -> Optional[str]:
+        """获取服务器，优先使用指定的服务器，否则轮转获取"""
+        now = time.time()
+        if preferred and self._server_cooldown.get(preferred, 0) <= now:
+            return preferred
+        return self._get_available_server()
 
     def _mark_server_unavailable(self, url: str, cooldown: float = None):
         """标记服务器暂时不可用"""
@@ -413,58 +426,87 @@ class AsyncYtDlpClient:
 
     async def download(
         self, url: str, params: Optional[dict] = None,
-        save_dir: str = ".", show_progress: bool = True
+        save_dir: str = ".", show_progress: bool = True,
+        server: str = None
     ) -> tuple[TaskStatus, list[str]]:
         """一站式下载：创建任务、等待完成、下载文件。支持 Ctrl+C 取消任务。
 
-        如果任务不存在（可能被服务器清理），会自动重新创建任务。
+        如果任务不存在或服务器不可用，会自动切换到其他服务器重试。
+
+        Args:
+            server: 指定使用的服务器，不可用时自动切换
 
         返回: (任务状态详情, 下载的文件路径列表)
         """
+        tried_servers = set()
         task_id = None
-        try:
-            task_id, existed = await self.create_task(url, params)
-            if show_progress:
-                print(f"{'任务已存在' if existed else '创建任务'}: {task_id}")
+
+        while True:
+            current_server = self.get_server(server)
+            if not current_server:
+                current_server = await self._wait_for_server()
+
+            if current_server in tried_servers:
+                # 所有服务器都试过了
+                raise NetworkError("所有服务器都不可用")
+            tried_servers.add(current_server)
 
             try:
+                task_id, existed = await self._create_task_on_server(url, params, current_server)
+                if show_progress:
+                    print(f"{'任务已存在' if existed else '创建任务'}: {task_id} @ {current_server}")
+
                 status = await self.wait_for_task(task_id, show_progress)
+
+                if status.status == "failed":
+                    raise TaskFailedError(task_id, status.error)
+                if status.status == "cancelled":
+                    raise TaskCancelledError(task_id)
+
+                # 使用 parfive 批量下载所有文件
+                files_to_download = [
+                    (f.download_url, os.path.join(save_dir, f.filename))
+                    for f in status.files
+                ]
+                if show_progress:
+                    print(f"开始下载 {len(files_to_download)} 个文件...")
+                downloaded = await self.download_files(files_to_download, show_progress)
+
+                return status, downloaded
+
             except TaskNotFoundError:
-                # 任务不存在（可能被服务器清理或路由到错误服务器），重新创建
                 if show_progress:
-                    print(f"\n任务 {task_id} 不存在，重新创建...")
+                    print(f"\n任务 {task_id} 不存在，切换服务器重试...")
                 self._task_server.pop(task_id, None)
-                task_id, _ = await self.create_task(url, params)
+                self._mark_server_unavailable(current_server)
+                server = None  # 清除指定服务器，让下次轮转选择
+                continue
+
+            except NetworkError:
                 if show_progress:
-                    print(f"新任务: {task_id}")
-                status = await self.wait_for_task(task_id, show_progress)
+                    print(f"\n服务器 {current_server} 不可用，切换服务器重试...")
+                self._mark_server_unavailable(current_server)
+                server = None
+                continue
 
-            if status.status == "failed":
-                raise TaskFailedError(task_id, status.error)
-            if status.status == "cancelled":
-                raise TaskCancelledError(task_id)
-
-            # 使用 parfive 批量下载所有文件
-            files_to_download = [
-                (f.download_url, os.path.join(save_dir, f.filename))
-                for f in status.files
-            ]
-            if show_progress:
-                print(f"开始下载 {len(files_to_download)} 个文件...")
-            downloaded = await self.download_files(files_to_download, show_progress)
-
-            return status, downloaded
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            if task_id:
-                if show_progress:
-                    print(f"\n检测到中断，正在取消任务 {task_id}...")
-                try:
-                    await self.cancel_task(task_id)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                if task_id:
                     if show_progress:
-                        print(f"任务 {task_id} 已取消")
-                except Exception:
-                    pass
-            raise
+                        print(f"\n检测到中断，正在取消任务 {task_id}...")
+                    try:
+                        await self.cancel_task(task_id)
+                        if show_progress:
+                            print(f"任务 {task_id} 已取消")
+                    except Exception:
+                        pass
+                raise
+
+    async def _create_task_on_server(self, url: str, params: Optional[dict], server: str) -> tuple[str, bool]:
+        """在指定服务器上创建任务"""
+        data, actual_server = await self._request("POST", "/tasks", preferred_server=server, json={"url": url, "params": params or {}})
+        task_id = data["task_id"]
+        self._task_server[task_id] = actual_server
+        return task_id, data.get("existed", False)
 
     async def batch_download(
         self, urls: list[str], params: Optional[dict] = None, show_progress: bool = True
