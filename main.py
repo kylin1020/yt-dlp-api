@@ -244,17 +244,29 @@ def db_find_reusable_task(url: str, params: dict | None) -> str | None:
 
 
 def _cleanup_task(task_id: str, task_dir: str | None):
+    import logging
+    logger = logging.getLogger(__name__)
+    
     if task_dir and Path(task_dir).exists():
         rmtree(task_dir)
+        logger.info(f"[cleanup] 已删除本地目录: {task_dir}")
+    
     if r2_client:
         try:
             r2_keys = db_get_r2_keys_by_task(task_id)
             if r2_keys:
-                r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
-        except Exception:
-            pass
+                response = r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
+                deleted = response.get("Deleted", [])
+                errors = response.get("Errors", [])
+                logger.info(f"[cleanup] R2删除结果 task={task_id}: 成功={len(deleted)}, 失败={len(errors)}, keys={r2_keys}")
+                if errors:
+                    logger.error(f"[cleanup] R2删除错误: {errors}")
+        except Exception as e:
+            logger.error(f"[cleanup] R2删除异常 task={task_id}: {e}")
+    
     db_delete_file_mappings_by_task(task_id)
     db_delete_task(task_id)
+    logger.info(f"[cleanup] 任务清理完成: {task_id}")
 
 
 async def cleanup_expired_tasks():
@@ -464,17 +476,29 @@ async def download_file(file_id: str):
 
 
 def _delete_task_sync(task_id: str, task_dir: str | None):
+    import logging
+    logger = logging.getLogger(__name__)
+    
     if task_dir and Path(task_dir).exists():
         rmtree(task_dir)
+        logger.info(f"[delete] 已删除本地目录: {task_dir}")
+    
     if r2_client:
         try:
             r2_keys = db_get_r2_keys_by_task(task_id)
             if r2_keys:
-                r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
-        except Exception:
-            pass
+                response = r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
+                deleted = response.get("Deleted", [])
+                errors = response.get("Errors", [])
+                logger.info(f"[delete] R2删除结果 task={task_id}: 成功={len(deleted)}, 失败={len(errors)}, keys={r2_keys}")
+                if errors:
+                    logger.error(f"[delete] R2删除错误: {errors}")
+        except Exception as e:
+            logger.error(f"[delete] R2删除异常 task={task_id}: {e}")
+    
     db_delete_file_mappings_by_task(task_id)
     db_delete_task(task_id)
+    logger.info(f"[delete] 任务删除完成: {task_id}")
 
 
 @app.delete("/tasks/{task_id}")
@@ -564,6 +588,43 @@ async def get_monitor():
             "estimated_idle": format_eta(max_eta_seconds) if max_eta_seconds > 0 else "空闲",
         },
     }
+
+
+@app.get("/debug/expired-tasks")
+async def debug_expired_tasks():
+    """调试：查看即将过期的任务"""
+    expired = db_get_expired_tasks()
+    tasks_info = []
+    for task_id, task_dir in expired:
+        r2_keys = db_get_r2_keys_by_task(task_id)
+        tasks_info.append({
+            "task_id": task_id,
+            "task_dir": task_dir,
+            "r2_keys": r2_keys,
+            "local_exists": task_dir and Path(task_dir).exists()
+        })
+    return {
+        "expire_seconds": TASK_EXPIRE_SECONDS,
+        "cleanup_interval": CLEANUP_INTERVAL,
+        "r2_enabled": R2_ENABLED,
+        "r2_client_initialized": r2_client is not None,
+        "expired_count": len(expired),
+        "expired_tasks": tasks_info
+    }
+
+
+@app.post("/debug/cleanup-now")
+async def debug_cleanup_now():
+    """调试：立即执行一次清理"""
+    loop = asyncio.get_event_loop()
+    expired = await loop.run_in_executor(None, db_get_expired_tasks)
+    cleaned = []
+    for task_id, task_dir in expired:
+        r2_keys = db_get_r2_keys_by_task(task_id)
+        await loop.run_in_executor(None, _cleanup_task, task_id, task_dir)
+        runtime_state.pop(task_id, None)
+        cleaned.append({"task_id": task_id, "r2_keys": r2_keys})
+    return {"cleaned_count": len(cleaned), "cleaned_tasks": cleaned}
 
 
 if __name__ == "__main__":
