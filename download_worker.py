@@ -3,10 +3,11 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Queue
 from pathlib import Path
+from queue import Queue, Empty
 from shutil import rmtree
 from typing import Any
 from urllib.parse import quote
@@ -33,6 +34,10 @@ DB_PATH = DATA_DIR / "tasks.db"
 
 # 并发下载数
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
+
+# 全局状态
+_cancel_set: set[str] = set()
+_cancel_lock = threading.Lock()
 
 
 def _get_db_conn():
@@ -91,166 +96,221 @@ def _generate_file_id(task_id: str, filename: str) -> str:
     return hashlib.md5(f"{task_id}:{filename}".encode()).hexdigest()
 
 
-def _download_single_task(task_id: str, url: str, user_params: dict[str, Any] | None,
-                          progress_queue: Queue, cancel_set: dict):
-    """执行单个下载任务（在线程中运行）"""
-    task_dir = TEMP_BASE_DIR / task_id
-    task_dir.mkdir(parents=True, exist_ok=True)
+def _is_cancelled(task_id: str) -> bool:
+    """检查任务是否被取消"""
+    with _cancel_lock:
+        return task_id in _cancel_set
 
-    r2_client, r2_transfer_config = _init_r2_client()
 
-    def check_cancelled():
-        return cancel_set.get(task_id, False)
+def _mark_cancelled(task_id: str):
+    """标记任务为取消"""
+    with _cancel_lock:
+        _cancel_set.add(task_id)
 
-    def progress_hook(d: dict):
-        if check_cancelled():
-            raise Exception("任务已取消")
-        if d["status"] == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
-            downloaded = d.get("downloaded_bytes", 0)
-            speed = d.get("speed")
-            progress_queue.put({
-                "task_id": task_id,
-                "type": "progress",
-                "progress": (downloaded / total * 100) if total > 0 else 0,
-                "total_bytes": total,
-                "downloaded_bytes": downloaded,
-                "speed": speed or 0
-            })
-        elif d["status"] == "finished":
-            progress_queue.put({
-                "task_id": task_id,
-                "type": "progress",
-                "progress": 100
-            })
 
-    _db_update_status(task_id, "downloading", task_dir=str(task_dir))
+def _clear_cancelled(task_id: str):
+    """清除取消标记"""
+    with _cancel_lock:
+        _cancel_set.discard(task_id)
 
-    base_params = {
-        "noplaylist": True,
-        "retries": 5,
-        "extractor_retries": 1,
-        "nocheckcertificate": True,
-        "concurrent_fragment_downloads": 8,
-        "outtmpl": str(task_dir / "%(title).100s.%(ext)s"),
-        "progress_hooks": [progress_hook]
-    }
 
-    if user_params:
-        user_params.pop("outtmpl", None)
-        user_params.pop("progress_hooks", None)
-        base_params.update(user_params)
+class DownloadWorker:
+    """下载工作器 - 在主进程中运行，使用线程池"""
 
-    started_at = time.time()
-    info = None
+    def __init__(self, max_concurrent: int = MAX_CONCURRENT):
+        self.max_concurrent = max_concurrent
+        self.semaphore = threading.BoundedSemaphore(max_concurrent)
+        self.executor = ThreadPoolExecutor(max_workers=256)
+        self.task_queue: Queue = Queue()
+        self.progress_callbacks: list = []
+        self._running = False
+        self._worker_thread: threading.Thread | None = None
 
-    try:
-        with YoutubeDL(base_params) as ydl:
-            extracted_info = ydl.extract_info(url, download=True)
-            info = ydl.sanitize_info(extracted_info)
+    def set_max_concurrent(self, value: int):
+        """动态设置最大并发数"""
+        if value > 0:
+            self.max_concurrent = value
+            self.semaphore = threading.BoundedSemaphore(value)
 
-        files = list(task_dir.iterdir())
-        if files:
-            file_list = []
-            if r2_client:
-                _db_update_status(task_id, "uploading")
-                progress_queue.put({"task_id": task_id, "type": "progress", "progress": 0})
+    def add_progress_callback(self, callback):
+        """添加进度回调"""
+        self.progress_callbacks.append(callback)
 
-            file_count = len([x for x in files if x.is_file()])
-            for idx, f in enumerate(files):
-                if f.is_file():
-                    file_id = _generate_file_id(task_id, f.name)
-                    file_size = f.stat().st_size
+    def _notify_progress(self, msg: dict):
+        """通知进度更新"""
+        for cb in self.progress_callbacks:
+            try:
+                cb(msg)
+            except:
+                pass
 
-                    if r2_client:
-                        ext = f.suffix
-                        hash_name = f"{file_id}{ext}"
-                        object_key = f"{task_id}/{hash_name}"
-                        r2_client.upload_file(
-                            str(f), R2_BUCKET_NAME, object_key,
-                            Config=r2_transfer_config,
-                            ExtraArgs={"ContentDisposition": f"attachment; filename*=UTF-8''{quote(f.name)}"}
-                        )
-                        _db_save_file_mapping(file_id, task_id, f.name, str(f), r2_key=object_key)
-                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
-                        progress_queue.put({
-                            "task_id": task_id,
-                            "type": "progress",
-                            "progress": ((idx + 1) / file_count) * 100
-                        })
-                    else:
-                        _db_save_file_mapping(file_id, task_id, f.name, str(f))
-                        download_url = f"/download/{file_id}"
+    def submit_task(self, task_id: str, url: str, params: dict | None):
+        """提交下载任务"""
+        self.task_queue.put({"task_id": task_id, "url": url, "params": params})
 
-                    file_list.append({
-                        "filename": f.name,
-                        "size": file_size,
-                        "download_url": download_url
-                    })
+    def cancel_task(self, task_id: str):
+        """取消任务"""
+        _mark_cancelled(task_id)
 
-            total_size = sum(f.stat().st_size for f in files if f.is_file())
-            elapsed = time.time() - started_at
-            if elapsed > 0 and total_size > 0:
-                progress_queue.put({
+    def start(self):
+        """启动工作器"""
+        self._running = True
+        self._worker_thread = threading.Thread(target=self._run, daemon=True)
+        self._worker_thread.start()
+
+    def stop(self):
+        """停止工作器"""
+        self._running = False
+        self.task_queue.put(None)  # 发送退出信号
+        if self._worker_thread:
+            self._worker_thread.join(timeout=5)
+        self.executor.shutdown(wait=False)
+
+    def _run(self):
+        """工作器主循环"""
+        while self._running:
+            try:
+                msg = self.task_queue.get(timeout=0.5)
+                if msg is None:
+                    break
+                task_id = msg["task_id"]
+                url = msg["url"]
+                params = msg.get("params")
+                self.executor.submit(self._download_with_semaphore, task_id, url, params)
+            except Empty:
+                continue
+            except:
+                pass
+
+    def _download_with_semaphore(self, task_id: str, url: str, params: dict | None):
+        """带信号量控制的下载"""
+        self.semaphore.acquire()
+        try:
+            self._download_single_task(task_id, url, params)
+        finally:
+            self.semaphore.release()
+
+    def _download_single_task(self, task_id: str, url: str, user_params: dict[str, Any] | None):
+        """执行单个下载任务"""
+        task_dir = TEMP_BASE_DIR / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        r2_client, r2_transfer_config = _init_r2_client()
+
+        def check_cancelled():
+            return _is_cancelled(task_id)
+
+        def progress_hook(d: dict):
+            if check_cancelled():
+                raise Exception("任务已取消")
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+                downloaded = d.get("downloaded_bytes", 0)
+                speed = d.get("speed")
+                self._notify_progress({
                     "task_id": task_id,
                     "type": "progress",
-                    "speed": total_size / elapsed,
-                    "total_bytes": total_size
+                    "progress": (downloaded / total * 100) if total > 0 else 0,
+                    "total_bytes": total,
+                    "downloaded_bytes": downloaded,
+                    "speed": speed or 0
+                })
+            elif d["status"] == "finished":
+                self._notify_progress({
+                    "task_id": task_id,
+                    "type": "progress",
+                    "progress": 100
                 })
 
-            _db_update_status(task_id, "completed", files=file_list, info=info, finished_at=time.time())
+        _db_update_status(task_id, "downloading", task_dir=str(task_dir))
 
-            if r2_client and task_dir.exists():
-                rmtree(task_dir)
-        else:
-            _db_update_status(task_id, "failed", error="下载完成但未找到文件", finished_at=time.time())
+        base_params = {
+            "noplaylist": True,
+            "retries": 5,
+            "extractor_retries": 1,
+            "nocheckcertificate": True,
+            "concurrent_fragment_downloads": 8,
+            "outtmpl": str(task_dir / "%(title).100s.%(ext)s"),
+            "progress_hooks": [progress_hook]
+        }
 
-    except Exception as e:
-        if check_cancelled():
-            _db_update_status(task_id, "cancelled", finished_at=time.time())
-            if task_dir.exists():
-                rmtree(task_dir)
-        else:
-            _db_update_status(task_id, "failed", error=str(e), finished_at=time.time())
+        if user_params:
+            user_params.pop("outtmpl", None)
+            user_params.pop("progress_hooks", None)
+            base_params.update(user_params)
 
-    finally:
-        progress_queue.put({"task_id": task_id, "type": "done"})
-        cancel_set.pop(task_id, None)
+        started_at = time.time()
+        info = None
 
-
-def worker_process(task_queue: Queue, progress_queue: Queue, cancel_set: dict, config: dict):
-    """后台工作进程主函数 - 使用信号量控制并发"""
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
-    # 使用信号量控制并发数，支持动态调整
-    semaphore = threading.BoundedSemaphore(config.get("max_concurrent", MAX_CONCURRENT))
-    executor = ThreadPoolExecutor(max_workers=256)  # 设置较大的线程池，实际并发由信号量控制
-
-    def run_with_semaphore(task_id, url, params):
-        semaphore.acquire()
         try:
-            _download_single_task(task_id, url, params, progress_queue, cancel_set)
+            with YoutubeDL(base_params) as ydl:
+                extracted_info = ydl.extract_info(url, download=True)
+                info = ydl.sanitize_info(extracted_info)
+
+            files = list(task_dir.iterdir())
+            if files:
+                file_list = []
+                if r2_client:
+                    _db_update_status(task_id, "uploading")
+                    self._notify_progress({"task_id": task_id, "type": "progress", "progress": 0})
+
+                file_count = len([x for x in files if x.is_file()])
+                for idx, f in enumerate(files):
+                    if f.is_file():
+                        file_id = _generate_file_id(task_id, f.name)
+                        file_size = f.stat().st_size
+
+                        if r2_client:
+                            ext = f.suffix
+                            hash_name = f"{file_id}{ext}"
+                            object_key = f"{task_id}/{hash_name}"
+                            r2_client.upload_file(
+                                str(f), R2_BUCKET_NAME, object_key,
+                                Config=r2_transfer_config,
+                                ExtraArgs={"ContentDisposition": f"attachment; filename*=UTF-8''{quote(f.name)}"}
+                            )
+                            _db_save_file_mapping(file_id, task_id, f.name, str(f), r2_key=object_key)
+                            download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
+                            self._notify_progress({
+                                "task_id": task_id,
+                                "type": "progress",
+                                "progress": ((idx + 1) / file_count) * 100
+                            })
+                        else:
+                            _db_save_file_mapping(file_id, task_id, f.name, str(f))
+                            download_url = f"/download/{file_id}"
+
+                        file_list.append({
+                            "filename": f.name,
+                            "size": file_size,
+                            "download_url": download_url
+                        })
+
+                total_size = sum(f.stat().st_size for f in files if f.is_file())
+                elapsed = time.time() - started_at
+                if elapsed > 0 and total_size > 0:
+                    self._notify_progress({
+                        "task_id": task_id,
+                        "type": "progress",
+                        "speed": total_size / elapsed,
+                        "total_bytes": total_size
+                    })
+
+                _db_update_status(task_id, "completed", files=file_list, info=info, finished_at=time.time())
+
+                if r2_client and task_dir.exists():
+                    rmtree(task_dir)
+            else:
+                _db_update_status(task_id, "failed", error="下载完成但未找到文件", finished_at=time.time())
+
+        except Exception as e:
+            if check_cancelled():
+                _db_update_status(task_id, "cancelled", finished_at=time.time())
+                if task_dir.exists():
+                    rmtree(task_dir)
+            else:
+                _db_update_status(task_id, "failed", error=str(e), finished_at=time.time())
+
         finally:
-            semaphore.release()
-
-    while True:
-        try:
-            msg = task_queue.get()
-            if msg is None:  # 退出信号
-                break
-            if msg.get("type") == "config":
-                # 动态调整并发数
-                new_max = msg.get("max_concurrent")
-                if new_max and new_max > 0:
-                    # 重新创建信号量（注意：这会在下一个任务生效）
-                    semaphore = threading.BoundedSemaphore(new_max)
-                continue
-            task_id = msg["task_id"]
-            url = msg["url"]
-            params = msg.get("params")
-            executor.submit(run_with_semaphore, task_id, url, params)
-        except Exception:
-            pass
-
-    executor.shutdown(wait=True)
+            self._notify_progress({"task_id": task_id, "type": "done"})
+            _clear_cancelled(task_id)
