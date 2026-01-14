@@ -38,7 +38,7 @@ if R2_ENABLED and R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY and R2_BUCKE
         aws_secret_access_key=R2_SECRET_KEY,
     )
     r2_transfer_config = TransferConfig(
-        multipart_threshold=1024 * 1024 * 25,   # 25MB 开始分片
+        multipart_threshold=1024 * 1024 * 100,   # 100MB 开始分片
         multipart_chunksize=1024 * 1024 * 256,  # 256MB 分片大小
         max_concurrency=10,
         use_threads=True
