@@ -388,8 +388,11 @@ class AsyncYtDlpClient:
     async def download(
         self, url: str, params: Optional[dict] = None,
         save_dir: str = ".", show_progress: bool = True
-    ) -> list[str]:
-        """一站式下载：创建任务、等待完成、下载文件。支持 Ctrl+C 取消任务。"""
+    ) -> tuple[TaskStatus, list[str]]:
+        """一站式下载：创建任务、等待完成、下载文件。支持 Ctrl+C 取消任务。
+
+        返回: (任务状态详情, 下载的文件路径列表)
+        """
         task_id = None
         try:
             task_id, existed = await self.create_task(url, params)
@@ -410,7 +413,8 @@ class AsyncYtDlpClient:
             ]
             if show_progress:
                 print(f"开始下载 {len(files_to_download)} 个文件...")
-            return self.download_files(files_to_download, show_progress)
+            downloaded = self.download_files(files_to_download, show_progress)
+            return status, downloaded
         except (KeyboardInterrupt, asyncio.CancelledError):
             if task_id:
                 if show_progress:
