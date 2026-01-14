@@ -144,6 +144,8 @@ class AsyncYtDlpClient:
         self._client: Optional[httpx.AsyncClient] = None
         # 服务器状态：{url: 可用时间戳}，0 表示可用
         self._server_cooldown: dict[str, float] = {url: 0 for url in self.base_urls}
+        # 任务亲和性：{task_id: server_url}，记录任务创建在哪个服务器
+        self._task_server: dict[str, str] = {}
 
     @property
     def base_url(self) -> str:
@@ -195,17 +197,22 @@ class AsyncYtDlpClient:
                 await asyncio.sleep(min(min_wait, 5.0))  # 最多等 5 秒后重新检查
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
-    async def _request(self, method: str, path: str, **kwargs) -> dict:
-        """统一请求处理（自动故障转移和重试）"""
+    async def _request(self, method: str, path: str, preferred_server: str = None, **kwargs) -> tuple[dict, str]:
+        """统一请求处理（自动故障转移和重试）
+
+        返回: (响应数据, 实际使用的服务器URL)
+        """
         last_error = None
-        tried_servers = set()
 
-        for attempt in range(self.retry_attempts):
-            server = self._get_available_server()
-            if not server:
-                server = await self._wait_for_server()
+        for _ in range(self.retry_attempts):
+            # 优先使用指定的服务器（任务亲和性）
+            if preferred_server and self._server_cooldown.get(preferred_server, 0) <= time.time():
+                server = preferred_server
+            else:
+                server = self._get_available_server()
+                if not server:
+                    server = await self._wait_for_server()
 
-            tried_servers.add(server)
             try:
                 resp = await self.client.request(method, f"{server}{path}", **kwargs)
 
@@ -213,7 +220,6 @@ class AsyncYtDlpClient:
                     raise TaskNotFoundError(path.split("/")[-1])
 
                 if resp.status_code == 429:
-                    # 获取 Retry-After 头，默认 60 秒
                     retry_after = float(resp.headers.get("Retry-After", self.cooldown_time))
                     self._mark_server_unavailable(server, retry_after)
                     last_error = RateLimitError(retry_after)
@@ -228,26 +234,29 @@ class AsyncYtDlpClient:
                     detail = resp.json().get("detail", resp.text) if resp.text else "未知错误"
                     raise ApiError(resp.status_code, detail)
 
-                # 请求成功，确保服务器标记为可用
                 self._mark_server_available(server)
-                return resp.json()
+                return resp.json(), server
 
             except httpx.RequestError as e:
                 self._mark_server_unavailable(server)
                 last_error = NetworkError(f"网络请求失败: {e}")
                 continue
 
-        # 所有重试都失败
         raise last_error or NetworkError("所有服务器都不可用")
 
     async def create_task(self, url: str, params: Optional[dict] = None) -> tuple[str, bool]:
         """创建下载任务，返回 (task_id, existed)"""
-        data = await self._request("POST", "/tasks", json={"url": url, "params": params or {}})
-        return data["task_id"], data.get("existed", False)
+        data, server = await self._request("POST", "/tasks", json={"url": url, "params": params or {}})
+        task_id = data["task_id"]
+        # 记录任务创建在哪个服务器
+        self._task_server[task_id] = server
+        return task_id, data.get("existed", False)
 
     async def get_task(self, task_id: str) -> TaskStatus:
         """获取任务状态"""
-        data = await self._request("GET", f"/tasks/{task_id}")
+        # 优先使用任务创建时的服务器
+        preferred = self._task_server.get(task_id)
+        data, _ = await self._request("GET", f"/tasks/{task_id}", preferred_server=preferred)
         files = [
             TaskFile(f["filename"], f["size"], f["download_url"])
             for f in data.get("files") or []
@@ -261,12 +270,15 @@ class AsyncYtDlpClient:
 
     async def cancel_task(self, task_id: str) -> str:
         """取消任务"""
-        data = await self._request("POST", f"/tasks/{task_id}/cancel")
+        preferred = self._task_server.get(task_id)
+        data, _ = await self._request("POST", f"/tasks/{task_id}/cancel", preferred_server=preferred)
         return data["message"]
 
     async def delete_task(self, task_id: str) -> str:
         """删除任务"""
-        data = await self._request("DELETE", f"/tasks/{task_id}")
+        preferred = self._task_server.get(task_id)
+        data, _ = await self._request("DELETE", f"/tasks/{task_id}", preferred_server=preferred)
+        self._task_server.pop(task_id, None)
         return data["message"]
 
     async def download_file(self, file_id: str, save_path: str, show_progress: bool = True) -> str:
@@ -358,17 +370,18 @@ class AsyncYtDlpClient:
 
     async def get_max_concurrent(self) -> tuple[int, int]:
         """获取最大并发数和当前活跃数"""
-        data = await self._request("GET", "/settings/max-concurrent")
+        data, _ = await self._request("GET", "/settings/max-concurrent")
         return data["max_concurrent"], data["active_count"]
 
     async def set_max_concurrent(self, value: int) -> int:
         """设置最大并发数"""
-        data = await self._request("PUT", "/settings/max-concurrent", json={"value": value})
+        data, _ = await self._request("PUT", "/settings/max-concurrent", json={"value": value})
         return data["max_concurrent"]
 
     async def get_monitor(self) -> dict:
         """获取系统监控信息"""
-        return await self._request("GET", "/monitor")
+        data, _ = await self._request("GET", "/monitor")
+        return data
 
     async def wait_for_task(
         self, task_id: str, show_progress: bool = True, poll_interval: float = 1.0
@@ -404,6 +417,8 @@ class AsyncYtDlpClient:
     ) -> tuple[TaskStatus, list[str]]:
         """一站式下载：创建任务、等待完成、下载文件。支持 Ctrl+C 取消任务。
 
+        如果任务不存在（可能被服务器清理），会自动重新创建任务。
+
         返回: (任务状态详情, 下载的文件路径列表)
         """
         task_id = None
@@ -412,7 +427,17 @@ class AsyncYtDlpClient:
             if show_progress:
                 print(f"{'任务已存在' if existed else '创建任务'}: {task_id}")
 
-            status = await self.wait_for_task(task_id, show_progress)
+            try:
+                status = await self.wait_for_task(task_id, show_progress)
+            except TaskNotFoundError:
+                # 任务不存在（可能被服务器清理或路由到错误服务器），重新创建
+                if show_progress:
+                    print(f"\n任务 {task_id} 不存在，重新创建...")
+                self._task_server.pop(task_id, None)
+                task_id, _ = await self.create_task(url, params)
+                if show_progress:
+                    print(f"新任务: {task_id}")
+                status = await self.wait_for_task(task_id, show_progress)
 
             if status.status == "failed":
                 raise TaskFailedError(task_id, status.error)
