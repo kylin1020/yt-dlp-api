@@ -25,6 +25,7 @@ if ! command -v uv &> /dev/null; then
 fi
 
 # 检查并安装 deno
+export PATH="$HOME/.deno/bin:$PATH"
 if ! command -v deno &> /dev/null; then
     echo "安装 deno..."
     apt install -y unzip
