@@ -287,12 +287,12 @@ class AsyncYtDlpClient:
             shutil.move(tmp_path, save_path)
         return save_path
 
-    def download_files(
+    async def download_files(
         self, files: list[tuple[str, str]], show_progress: bool = True,
         max_retries: int = 3
     ) -> list[str]:
         """
-        批量下载文件（同步方法，带进度显示）
+        批量下载文件（异步方法，带进度显示）
         files: [(file_id, save_path), ...]
         先下载到临时目录，全部完成后再移动到目标位置
         支持多服务器故障转移
@@ -312,7 +312,7 @@ class AsyncYtDlpClient:
                 dl = Downloader(max_conn=self.download_concurrent, progress=show_progress)
                 for url, path, filename, _ in pending:
                     dl.enqueue_file(url, path=path, filename=filename)
-                results = dl.download()
+                results = await dl.run_download()
 
                 if not results.errors:
                     break
@@ -413,7 +413,7 @@ class AsyncYtDlpClient:
             ]
             if show_progress:
                 print(f"开始下载 {len(files_to_download)} 个文件...")
-            downloaded = self.download_files(files_to_download, show_progress)
+            downloaded = await self.download_files(files_to_download, show_progress)
             return status, downloaded
         except (KeyboardInterrupt, asyncio.CancelledError):
             if task_id:
