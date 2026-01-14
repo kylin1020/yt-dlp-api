@@ -279,9 +279,9 @@ def cleanup_orphan_dirs():
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    # 将 downloading 状态重置为 pending（服务重启时恢复）
+    # 将 downloading/uploading 状态重置为 pending（服务重启时恢复）
     with db_lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE tasks SET status = 'pending', progress = 0 WHERE status = 'downloading'")
+        conn.execute("UPDATE tasks SET status = 'pending', progress = 0 WHERE status IN ('downloading', 'uploading')")
     cleanup_orphan_dirs()
     try_start_pending()
     task = asyncio.create_task(cleanup_expired_tasks())
@@ -397,7 +397,11 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
         files = list(task_dir.iterdir())
         if files:
             file_list = []
-            for f in files:
+            # 如果启用了 R2，先更新状态为 uploading
+            if r2_client:
+                db_update_status(task_id, "uploading")
+                runtime_state[task_id]["progress"] = 0
+            for idx, f in enumerate(files):
                 if f.is_file():
                     file_id = generate_file_id(task_id, f.name)
                     file_size = f.stat().st_size
@@ -407,6 +411,8 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
                         object_key = f"{task_id}/{f.name}"
                         r2_client.upload_file(str(f), R2_BUCKET_NAME, object_key, Config=r2_transfer_config)
                         download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
+                        # 更新上传进度
+                        runtime_state[task_id]["progress"] = ((idx + 1) / len([x for x in files if x.is_file()])) * 100
                     else:
                         db_save_file_mapping(file_id, task_id, f.name, str(f))
                         download_url = f"/download/{file_id}"
