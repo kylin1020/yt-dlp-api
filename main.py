@@ -11,6 +11,7 @@ from pathlib import Path
 from shutil import rmtree
 from threading import Lock
 from typing import Any
+from urllib.parse import quote
 
 import psutil
 from dotenv import load_dotenv
@@ -410,7 +411,7 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
                     if r2_client:
                         object_key = f"{task_id}/{f.name}"
                         r2_client.upload_file(str(f), R2_BUCKET_NAME, object_key, Config=r2_transfer_config)
-                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
+                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{task_id}/{quote(f.name)}"
                         # 更新上传进度
                         runtime_state[task_id]["progress"] = ((idx + 1) / len([x for x in files if x.is_file()])) * 100
                     else:
