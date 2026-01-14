@@ -1,9 +1,10 @@
-"""子进程下载模块 - 在独立进程中执行 yt-dlp 下载，避免 GIL 阻塞主进程"""
+"""单一后台下载进程 - 内部使用线程池并发下载"""
 import hashlib
 import json
 import os
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Queue
 from pathlib import Path
 from shutil import rmtree
@@ -30,9 +31,12 @@ TEMP_BASE_DIR = Path(os.getenv("TEMP_DIR", "/tmp/yt-dlp-downloads"))
 DATA_DIR = Path(__file__).parent / "data"
 DB_PATH = DATA_DIR / "tasks.db"
 
+# 并发下载数
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
+
 
 def _get_db_conn():
-    """获取数据库连接，设置 timeout 避免锁冲突"""
+    """获取数据库连接"""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -87,9 +91,9 @@ def _generate_file_id(task_id: str, filename: str) -> str:
     return hashlib.md5(f"{task_id}:{filename}".encode()).hexdigest()
 
 
-def download_in_subprocess(task_id: str, url: str, user_params: dict[str, Any] | None,
-                           progress_queue: Queue, cancel_set: dict):
-    """在子进程中执行下载任务"""
+def _download_single_task(task_id: str, url: str, user_params: dict[str, Any] | None,
+                          progress_queue: Queue, cancel_set: dict):
+    """执行单个下载任务（在线程中运行）"""
     task_dir = TEMP_BASE_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -211,5 +215,42 @@ def download_in_subprocess(task_id: str, url: str, user_params: dict[str, Any] |
 
     finally:
         progress_queue.put({"task_id": task_id, "type": "done"})
-        # 清理取消标记
         cancel_set.pop(task_id, None)
+
+
+def worker_process(task_queue: Queue, progress_queue: Queue, cancel_set: dict, config: dict):
+    """后台工作进程主函数 - 使用信号量控制并发"""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    # 使用信号量控制并发数，支持动态调整
+    semaphore = threading.BoundedSemaphore(config.get("max_concurrent", MAX_CONCURRENT))
+    executor = ThreadPoolExecutor(max_workers=256)  # 设置较大的线程池，实际并发由信号量控制
+
+    def run_with_semaphore(task_id, url, params):
+        semaphore.acquire()
+        try:
+            _download_single_task(task_id, url, params, progress_queue, cancel_set)
+        finally:
+            semaphore.release()
+
+    while True:
+        try:
+            msg = task_queue.get()
+            if msg is None:  # 退出信号
+                break
+            if msg.get("type") == "config":
+                # 动态调整并发数
+                new_max = msg.get("max_concurrent")
+                if new_max and new_max > 0:
+                    # 重新创建信号量（注意：这会在下一个任务生效）
+                    semaphore = threading.BoundedSemaphore(new_max)
+                continue
+            task_id = msg["task_id"]
+            url = msg["url"]
+            params = msg.get("params")
+            executor.submit(run_with_semaphore, task_id, url, params)
+        except Exception:
+            pass
+
+    executor.shutdown(wait=True)

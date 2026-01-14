@@ -10,7 +10,6 @@ import uuid
 from multiprocessing import Process, Queue
 from pathlib import Path
 from shutil import rmtree
-from threading import Lock
 from typing import Any
 
 import psutil
@@ -61,12 +60,12 @@ DB_PATH = DATA_DIR / "tasks.db"
 # 并发控制
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
 active_count = 0
-count_lock = Lock()
 
-# 子进程通信队列
-progress_queue: Queue = None
-cancel_set = None  # Manager().dict() 用于存储被取消的任务ID
-active_processes: dict[str, Process] = {}  # task_id -> Process
+# 进程间通信队列
+task_queue: Queue = None      # 发送任务给worker
+progress_queue: Queue = None  # 接收worker进度
+cancel_set = None             # 取消标记
+worker_process: Process = None
 
 # 任务清理配置（秒）
 TASK_EXPIRE_SECONDS = int(os.getenv("TASK_EXPIRE_SECONDS", "300"))
@@ -74,9 +73,6 @@ CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "60"))
 
 # 运行时状态（不持久化）
 runtime_state: dict[str, dict] = {}  # task_id -> {progress, speed, total_bytes}
-
-# 带宽监控
-bandwidth_stats = {"total_bytes": 0, "last_reset": time.time()}
 
 # 网络速度监控
 net_stats = {"last_bytes": 0, "last_time": 0.0, "speed": 0.0}
@@ -297,27 +293,16 @@ def generate_file_id(task_id: str, filename: str) -> str:
     return hashlib.md5(f"{task_id}:{filename}".encode()).hexdigest()
 
 
-def try_start_pending():
-    """尝试启动等待中的任务"""
-    global active_count
-    from download_worker import download_in_subprocess
-    with count_lock:
-        if active_count >= MAX_CONCURRENT:
-            return
+def submit_task(task_id: str, url: str, params: dict | None):
+    """提交任务到worker进程"""
+    task_queue.put({"task_id": task_id, "url": url, "params": params})
+
+
+def start_pending_tasks():
+    """启动所有pending任务"""
     pending = db_get_pending_tasks()
     for task_id, url, params in pending:
-        with count_lock:
-            if active_count >= MAX_CONCURRENT:
-                break
-            active_count += 1
-        p = Process(target=download_in_subprocess, args=(task_id, url, params, progress_queue, cancel_set))
-        p.start()
-        active_processes[task_id] = p
-        # 清理已完成的进程
-        for tid, proc in list(active_processes.items()):
-            if not proc.is_alive():
-                proc.close()
-                active_processes.pop(tid, None)
+        submit_task(task_id, url, params)
 
 
 def _cleanup_task(task_id: str, task_dir: str | None):
@@ -336,7 +321,7 @@ def _cleanup_task(task_id: str, task_dir: str | None):
 
 
 async def cleanup_expired_tasks():
-    """后台协程：清理过期任务并启动等待中的任务"""
+    """后台协程：清理过期任务"""
     loop = asyncio.get_event_loop()
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL)
@@ -344,7 +329,6 @@ async def cleanup_expired_tasks():
         for task_id, task_dir in expired:
             await loop.run_in_executor(None, _cleanup_task, task_id, task_dir)
             runtime_state.pop(task_id, None)
-        try_start_pending()
 
 
 def cleanup_orphan_dirs():
@@ -356,7 +340,7 @@ def cleanup_orphan_dirs():
 
 
 async def progress_listener():
-    """后台协程：监听子进程的进度更新"""
+    """后台协程：监听worker进程的进度更新"""
     global active_count
     loop = asyncio.get_event_loop()
     while True:
@@ -364,12 +348,7 @@ async def progress_listener():
             msg = await loop.run_in_executor(None, lambda: progress_queue.get(timeout=0.1))
             task_id = msg.get("task_id")
             if msg.get("type") == "done":
-                with count_lock:
-                    active_count -= 1
-                proc = active_processes.pop(task_id, None)
-                if proc:
-                    proc.close()
-                try_start_pending()
+                active_count = max(0, active_count - 1)
             elif msg.get("type") == "progress":
                 if task_id not in runtime_state:
                     runtime_state[task_id] = {}
@@ -382,26 +361,38 @@ async def progress_listener():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global progress_queue, cancel_set
+    global task_queue, progress_queue, cancel_set, worker_process
     manager = mp.Manager()
+    task_queue = manager.Queue()
     progress_queue = manager.Queue()
     cancel_set = manager.dict()
+
     init_db()
     # 将 downloading/uploading 状态重置为 pending（服务重启时恢复）
     with _get_db_conn() as conn:
         conn.execute("UPDATE tasks SET status = 'pending', progress = 0 WHERE status IN ('downloading', 'uploading')")
     cleanup_orphan_dirs()
-    try_start_pending()
+
+    # 启动单一后台worker进程
+    from download_worker import worker_process as worker_func
+    worker_config = {"max_concurrent": MAX_CONCURRENT}
+    worker_process = Process(target=worker_func, args=(task_queue, progress_queue, cancel_set, worker_config))
+    worker_process.start()
+
+    # 启动pending任务
+    start_pending_tasks()
+
     cleanup_task = asyncio.create_task(cleanup_expired_tasks())
     progress_task = asyncio.create_task(progress_listener())
     yield
     cleanup_task.cancel()
     progress_task.cancel()
-    # 清理所有子进程
-    for proc in active_processes.values():
-        if proc.is_alive():
-            proc.terminate()
-        proc.close()
+
+    # 停止worker进程
+    task_queue.put(None)  # 发送退出信号
+    worker_process.join(timeout=5)
+    if worker_process.is_alive():
+        worker_process.terminate()
     manager.shutdown()
 
 
@@ -462,7 +453,6 @@ def format_eta(seconds: float) -> str:
 async def create_task(request: DownloadRequest):
     """创建下载任务"""
     global active_count
-    from download_worker import download_in_subprocess
 
     # 检查是否已存在可复用的任务（相同URL和format）
     existing_task_id = db_find_reusable_task(request.url, request.params)
@@ -480,12 +470,9 @@ async def create_task(request: DownloadRequest):
     }
     db_save_task(task_id, task)
 
-    with count_lock:
-        if active_count < MAX_CONCURRENT:
-            active_count += 1
-            p = Process(target=download_in_subprocess, args=(task_id, request.url, request.params, progress_queue, cancel_set))
-            p.start()
-            active_processes[task_id] = p
+    # 提交任务到worker
+    active_count += 1
+    submit_task(task_id, request.url, request.params)
 
     return TaskResponse(task_id=task_id)
 
@@ -594,7 +581,7 @@ async def cancel_task(task_id: str):
     if status == "pending":
         db_update_status(task_id, "cancelled", finished_at=time.time())
     else:
-        # 通知子进程取消
+        # 通知worker取消
         cancel_set[task_id] = True
 
     return {"message": "任务取消请求已提交"}
@@ -608,12 +595,13 @@ async def get_max_concurrent():
 
 @app.put("/settings/max-concurrent")
 async def set_max_concurrent(value: int):
-    """设置最大并发数"""
+    """动态设置最大并发数"""
     global MAX_CONCURRENT
     if value < 1:
         raise HTTPException(status_code=400, detail="最大并发数必须大于0")
     MAX_CONCURRENT = value
-    try_start_pending()
+    # 通知worker进程更新并发数
+    task_queue.put({"type": "config", "max_concurrent": value})
     return {"max_concurrent": MAX_CONCURRENT}
 
 
