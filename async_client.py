@@ -122,14 +122,14 @@ class TaskStatus:
 class AsyncYtDlpClient:
     """yt-dlp API 异步客户端（支持多服务器负载均衡和故障转移）"""
 
-    DEFAULT_DOWNLOAD_CONCURRENT = 2  # 文件下载默认并发数，避免占满带宽
-    DEFAULT_COOLDOWN = 60.0  # 服务器冷却时间（秒）
+    DEFAULT_DOWNLOAD_CONCURRENT = 8  # 文件下载默认并发数
+    DEFAULT_COOLDOWN = 10.0  # 服务器冷却时间（秒）
 
     def __init__(
         self,
         base_urls: Union[str, list[str]] = "http://localhost:8000",
         timeout: float = 30.0,
-        download_concurrent: int = 2,
+        download_concurrent: int = 8,
         retry_attempts: int = 3,
         cooldown_time: float = 5.0,
     ):
