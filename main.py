@@ -265,24 +265,29 @@ def try_start_pending():
         executor.submit(download_task, task_id, url, params)
 
 
+def _cleanup_task(task_id: str, task_dir: str | None):
+    """同步清理单个任务（在线程池中执行）"""
+    if task_dir and Path(task_dir).exists():
+        rmtree(task_dir)
+    if r2_client:
+        try:
+            r2_keys = db_get_r2_keys_by_task(task_id)
+            if r2_keys:
+                r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
+        except Exception:
+            pass
+    db_delete_file_mappings_by_task(task_id)
+    db_delete_task(task_id)
+
+
 async def cleanup_expired_tasks():
     """后台协程：清理过期任务并启动等待中的任务"""
+    loop = asyncio.get_event_loop()
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL)
-        for task_id, task_dir in db_get_expired_tasks():
-            # 清理本地文件
-            if task_dir and Path(task_dir).exists():
-                rmtree(task_dir)
-            # 清理 R2 文件
-            if r2_client:
-                try:
-                    r2_keys = db_get_r2_keys_by_task(task_id)
-                    if r2_keys:
-                        r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
-                except Exception:
-                    pass
-            db_delete_file_mappings_by_task(task_id)
-            db_delete_task(task_id)
+        expired = await loop.run_in_executor(None, db_get_expired_tasks)
+        for task_id, task_dir in expired:
+            await loop.run_in_executor(None, _cleanup_task, task_id, task_dir)
             runtime_state.pop(task_id, None)
         try_start_pending()
 
