@@ -15,6 +15,7 @@ from typing import Optional, Union
 
 import httpx
 from parfive import Downloader
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 
 # ============ 异常定义 ============
@@ -193,6 +194,7 @@ class AsyncYtDlpClient:
             if min_wait > 0:
                 await asyncio.sleep(min(min_wait, 5.0))  # 最多等 5 秒后重新检查
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         """统一请求处理（自动故障转移和重试）"""
         last_error = None
@@ -425,6 +427,12 @@ class AsyncYtDlpClient:
             if show_progress:
                 print(f"开始下载 {len(files_to_download)} 个文件...")
             downloaded = await self.download_files(files_to_download, show_progress)
+
+            # 下载完成后删除任务，清理服务器上的文件
+            await self.delete_task(task_id)
+            if show_progress:
+                print(f"已删除服务器上的任务和文件: {task_id}")
+
             return status, downloaded
         except (KeyboardInterrupt, asyncio.CancelledError):
             if task_id:

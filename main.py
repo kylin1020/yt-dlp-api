@@ -106,9 +106,15 @@ def init_db():
                 file_id TEXT PRIMARY KEY,
                 task_id TEXT,
                 filename TEXT,
-                filepath TEXT
+                filepath TEXT,
+                r2_key TEXT
             )
         """)
+        # 兼容旧表结构
+        try:
+            conn.execute("ALTER TABLE file_mapping ADD COLUMN r2_key TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 
 def db_get_task(task_id: str) -> dict | None:
@@ -196,12 +202,12 @@ def db_get_all_task_ids() -> set[str]:
         return {r[0] for r in conn.execute("SELECT task_id FROM tasks").fetchall()}
 
 
-def db_save_file_mapping(file_id: str, task_id: str, filename: str, filepath: str):
+def db_save_file_mapping(file_id: str, task_id: str, filename: str, filepath: str, r2_key: str = None):
     """保存文件映射"""
     with db_lock, sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO file_mapping (file_id, task_id, filename, filepath) VALUES (?, ?, ?, ?)",
-            (file_id, task_id, filename, filepath)
+            "INSERT OR REPLACE INTO file_mapping (file_id, task_id, filename, filepath, r2_key) VALUES (?, ?, ?, ?, ?)",
+            (file_id, task_id, filename, filepath, r2_key)
         )
 
 
@@ -213,6 +219,19 @@ def db_get_file_mapping(file_id: str) -> dict | None:
         if not row:
             return None
         return {"task_id": row["task_id"], "filename": row["filename"], "filepath": row["filepath"]}
+
+
+def db_get_r2_keys_by_task(task_id: str) -> list[str]:
+    """获取任务的所有R2 keys"""
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT r2_key FROM file_mapping WHERE task_id = ? AND r2_key IS NOT NULL", (task_id,)).fetchall()
+        return [r[0] for r in rows]
+
+
+def db_delete_file_mappings_by_task(task_id: str):
+    """删除任务的所有文件映射"""
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM file_mapping WHERE task_id = ?", (task_id,))
 
 
 def db_find_reusable_task(url: str, params: dict | None) -> str | None:
@@ -257,13 +276,12 @@ async def cleanup_expired_tasks():
             # 清理 R2 文件
             if r2_client:
                 try:
-                    prefix = f"{task_id}/"
-                    resp = r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
-                    objects = [{"Key": obj["Key"]} for obj in resp.get("Contents", [])]
-                    if objects:
-                        r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
+                    r2_keys = db_get_r2_keys_by_task(task_id)
+                    if r2_keys:
+                        r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
                 except Exception:
                     pass
+            db_delete_file_mappings_by_task(task_id)
             db_delete_task(task_id)
             runtime_state.pop(task_id, None)
         try_start_pending()
@@ -419,6 +437,7 @@ def download_task(task_id: str, url: str, user_params: dict[str, Any] | None):
                             Config=r2_transfer_config,
                             ExtraArgs={"ContentDisposition": f"attachment; filename*=UTF-8''{quote(f.name)}"}
                         )
+                        db_save_file_mapping(file_id, task_id, f.name, str(f), r2_key=object_key)
                         download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
                         # 更新上传进度
                         runtime_state[task_id]["progress"] = ((idx + 1) / len([x for x in files if x.is_file()])) * 100
@@ -557,6 +576,16 @@ async def delete_task(task_id: str):
     if task_dir and Path(task_dir).exists():
         rmtree(task_dir)
 
+    # 清理 R2 文件
+    if r2_client:
+        try:
+            r2_keys = db_get_r2_keys_by_task(task_id)
+            if r2_keys:
+                r2_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": [{"Key": k} for k in r2_keys]})
+        except Exception:
+            pass
+
+    db_delete_file_mappings_by_task(task_id)
     db_delete_task(task_id)
     runtime_state.pop(task_id, None)
     cancelled_tasks.discard(task_id)
