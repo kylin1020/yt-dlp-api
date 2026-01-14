@@ -120,10 +120,48 @@ def init_db():
             pass
 
 
+class DBConnection:
+    """数据库连接上下文管理器，确保连接被正确关闭"""
+    def __init__(self):
+        self.conn = None
+
+    def __enter__(self):
+        import logging
+        max_retries = 3
+        retry_delay = 0.1
+
+        for attempt in range(max_retries):
+            try:
+                DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                self.conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
+                self.conn.execute("PRAGMA busy_timeout = 30000")
+                return self.conn
+            except sqlite3.OperationalError as e:
+                if attempt < max_retries - 1:
+                    logging.warning(f"数据库连接失败(尝试 {attempt + 1}/{max_retries}): {e}, 重试中...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logging.error(f"无法打开数据库文件: {DB_PATH}, 错误: {e}")
+                    logging.error(f"数据库目录存在: {DB_PATH.parent.exists()}, 可写: {os.access(DB_PATH.parent, os.W_OK)}")
+                    if DB_PATH.exists():
+                        logging.error(f"数据库文件存在: True, 可读: {os.access(DB_PATH, os.R_OK)}, 可写: {os.access(DB_PATH, os.W_OK)}")
+                    raise
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            try:
+                if exc_type is None:
+                    self.conn.commit()
+                else:
+                    self.conn.rollback()
+            finally:
+                self.conn.close()
+        return False
+
 def _get_db_conn():
-    """获取数据库连接，设置 timeout 避免锁冲突"""
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    return conn
+    """获取数据库连接上下文管理器"""
+    return DBConnection()
 
 
 def db_get_task(task_id: str) -> dict | None:
@@ -275,6 +313,11 @@ def try_start_pending():
         p = Process(target=download_in_subprocess, args=(task_id, url, params, progress_queue, cancel_set))
         p.start()
         active_processes[task_id] = p
+        # 清理已完成的进程
+        for tid, proc in list(active_processes.items()):
+            if not proc.is_alive():
+                proc.close()
+                active_processes.pop(tid, None)
 
 
 def _cleanup_task(task_id: str, task_dir: str | None):
@@ -323,7 +366,9 @@ async def progress_listener():
             if msg.get("type") == "done":
                 with count_lock:
                     active_count -= 1
-                active_processes.pop(task_id, None)
+                proc = active_processes.pop(task_id, None)
+                if proc:
+                    proc.close()
                 try_start_pending()
             elif msg.get("type") == "progress":
                 if task_id not in runtime_state:
@@ -352,6 +397,12 @@ async def lifespan(_app: FastAPI):
     yield
     cleanup_task.cancel()
     progress_task.cancel()
+    # 清理所有子进程
+    for proc in active_processes.values():
+        if proc.is_alive():
+            proc.terminate()
+        proc.close()
+    manager.shutdown()
 
 
 app = FastAPI(title="yt-dlp API", lifespan=lifespan)
