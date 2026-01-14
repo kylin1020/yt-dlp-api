@@ -418,7 +418,7 @@ async def create_task(request: DownloadRequest):
     if existing_task_id:
         return TaskResponse(task_id=existing_task_id, existed=True)
 
-    task_id = str(uuid.uuid4())
+    task_id = uuid.uuid4().hex
     task = {
         "status": "pending",
         "progress": 0,
