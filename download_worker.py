@@ -1,6 +1,7 @@
 """单一后台下载进程 - 内部使用线程池并发下载"""
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -12,8 +13,11 @@ from shutil import rmtree
 from typing import Any
 from urllib.parse import quote
 
+import ffmpeg
 from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -112,6 +116,23 @@ def _clear_cancelled(task_id: str):
     """清除取消标记"""
     with _cancel_lock:
         _cancel_set.discard(task_id)
+
+
+def _check_file_valid(file_path: str) -> bool:
+    """使用 ffmpeg 检查文件是否有效"""
+    try:
+        ffmpeg.probe(file_path)
+        return True
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode() if e.stderr else ""
+        logger.error(f"文件损坏 {file_path}: {stderr[:200]}")
+        return False
+    except FileNotFoundError:
+        logger.error("ffprobe 未安装，跳过文件检查")
+        return True  # ffprobe 不存在时跳过检查
+    except Exception as e:
+        logger.error(f"检查文件 {file_path} 失败: {str(e)[:100]}")
+        return True  # 其他异常时跳过检查，避免误删
 
 
 class DownloadWorker:
@@ -241,44 +262,59 @@ class DownloadWorker:
 
             files = list(task_dir.iterdir())
             if files:
+                # 检查文件有效性
+                valid_files = []
+                for f in files:
+                    if f.is_file():
+                        if _check_file_valid(str(f)):
+                            valid_files.append(f)
+                        else:
+                            logger.warning(f"文件损坏，已删除: {f.name}")
+                            f.unlink()
+
+                if not valid_files:
+                    _db_update_status(task_id, "failed", error="下载的文件全部损坏", finished_at=time.time())
+                    if task_dir.exists():
+                        rmtree(task_dir)
+                    return
+
                 file_list = []
                 if r2_client:
                     _db_update_status(task_id, "uploading")
                     self._notify_progress({"task_id": task_id, "type": "progress", "progress": 0})
 
-                file_count = len([x for x in files if x.is_file()])
-                for idx, f in enumerate(files):
-                    if f.is_file():
-                        file_id = _generate_file_id(task_id, f.name)
-                        file_size = f.stat().st_size
+                file_count = len(valid_files)
+                for idx, f in enumerate(valid_files):
+                    file_id = _generate_file_id(task_id, f.name)
+                    file_size = f.stat().st_size
 
-                        if r2_client:
-                            ext = f.suffix
-                            hash_name = f"{file_id}{ext}"
-                            object_key = f"{task_id}/{hash_name}"
-                            r2_client.upload_file(
-                                str(f), R2_BUCKET_NAME, object_key,
-                                Config=r2_transfer_config,
-                                ExtraArgs={"ContentDisposition": f"attachment; filename*=UTF-8''{quote(f.name)}"}
-                            )
-                            _db_save_file_mapping(file_id, task_id, f.name, str(f), r2_key=object_key)
-                            download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
-                            self._notify_progress({
-                                "task_id": task_id,
-                                "type": "progress",
-                                "progress": ((idx + 1) / file_count) * 100
-                            })
-                        else:
-                            _db_save_file_mapping(file_id, task_id, f.name, str(f))
-                            download_url = f"/download/{file_id}"
-
-                        file_list.append({
-                            "filename": f.name,
-                            "size": file_size,
-                            "download_url": download_url
+                    if r2_client:
+                        ext = f.suffix
+                        hash_name = f"{file_id}{ext}"
+                        object_key = f"{task_id}/{hash_name}"
+                        r2_client.upload_file(
+                            str(f), R2_BUCKET_NAME, object_key,
+                            Config=r2_transfer_config,
+                            ExtraArgs={"ContentDisposition": f"attachment; filename*=UTF-8''{quote(f.name)}"}
+                        )
+                        _db_save_file_mapping(file_id, task_id, f.name, str(f), r2_key=object_key)
+                        download_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{object_key}"
+                        self._notify_progress({
+                            "task_id": task_id,
+                            "type": "progress",
+                            "progress": ((idx + 1) / file_count) * 100
                         })
+                    else:
+                        _db_save_file_mapping(file_id, task_id, f.name, str(f))
+                        download_url = f"/download/{file_id}"
 
-                total_size = sum(f.stat().st_size for f in files if f.is_file())
+                    file_list.append({
+                        "filename": f.name,
+                        "size": file_size,
+                        "download_url": download_url
+                    })
+
+                total_size = sum(f.stat().st_size for f in valid_files)
                 elapsed = time.time() - started_at
                 if elapsed > 0 and total_size > 0:
                     self._notify_progress({
